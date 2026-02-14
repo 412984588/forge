@@ -1,17 +1,11 @@
 {
-  "id": "autoforge",
-  "name": "AutoForge",
-  "description": "PRD → Production Code Automation",
-  "version": "1.0.0",
-  "repository": "local:autoforge",
-  "entry": "./index.js",
+  "id": "forge",
+  "name": "Forge",
+  "description": "PRD → Production Code Automation - 完整的代码自动化系统",
+  "version": "2.2.0",
+  "entry": "index.js",
   "configSchema": {
     "type": "object",
-    "properties": {
-      "defaultArchitectModel": { "type": "string" },
-      "defaultCoderModel": { "type": "string" },
-      "defaultReviewerModel": { "type": "string" },
-      "defaultMaxParallel": { "type": "number", "default": 3 }
-    }
+    "properties": {}
   }
 }
