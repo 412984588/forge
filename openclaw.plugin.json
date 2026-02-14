@@ -2,7 +2,7 @@
   "id": "forge",
   "name": "Forge",
   "description": "PRD → Production Code Automation - 完整的代码自动化系统",
-  "version": "2.5.1",
+  "version": "2.5.2",
   "entry": "index.js",
   "configSchema": {
     "type": "object",

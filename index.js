@@ -20,6 +20,8 @@ const DB_PATH = path.join(
   "forge.db",
 );
 const PROJECTS_DIR = path.join(process.env.HOME || "/tmp", "forge-projects");
+const DEFAULT_MODEL =
+  process.env.FORGE_MODEL || "anthropic-newcli/claude-opus-4-6-20250528";
 
 // 确保 DB 目录存在
 const DB_DIR = path.dirname(DB_PATH);
@@ -27,10 +29,16 @@ if (!fs.existsSync(DB_DIR)) {
   fs.mkdirSync(DB_DIR, { recursive: true });
 }
 
+// P1: 数据库连接池（单例）
+let dbInstance = null;
+
 function initDB() {
+  if (dbInstance) return Promise.resolve(dbInstance);
+
   return new Promise((resolve, reject) => {
     const db = new sqlite3.Database(DB_PATH, (err) => {
       if (err) return reject(err);
+      dbInstance = db;
       db.serialize(() => {
         db.run(`CREATE TABLE IF NOT EXISTS projects (
           id TEXT PRIMARY KEY,
@@ -89,7 +97,9 @@ function initDB() {
 function closeDB(db) {
   try {
     db.close();
-  } catch {}
+  } catch (err) {
+    console.error("[forge] DB close error:", err);
+  }
 }
 
 function run(db, sql, params = []) {
@@ -168,13 +178,15 @@ function validateDependencies(features) {
 }
 
 function parsePRD(prdContent) {
-  if (!prdContent || typeof prdContent !== "string") {
-    return {
-      name: "Untitled Project",
-      overview: "",
-      features: [],
-      techStack: [],
-    };
+  // P1: 输入验证
+  if (prdContent === null || prdContent === undefined) {
+    throw new Error("PRD content is required");
+  }
+  if (typeof prdContent !== "string") {
+    throw new Error("PRD must be a string, got " + typeof prdContent);
+  }
+  if (prdContent.trim().length === 0) {
+    return { name: "Empty Project", overview: "", features: [], techStack: [] };
   }
 
   const lines = prdContent.split("\n");
