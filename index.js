@@ -367,10 +367,15 @@ export default function register(api) {
           fs.writeFileSync(path.join(workdir, "PRD.md"), prdContent);
 
           const defaultOptions = {
-            architectModel: "anthropic-newcli/claude-opus-4-6-20250528",
-            coderModel: "anthropic-newcli/claude-opus-4-6-20250528",
-            reviewerModel: "anthropic-newcli/claude-opus-4-6-20250528",
-            maxParallel: 3,
+            architectModel:
+              options.architectModel ||
+              "anthropic-newcli/claude-opus-4-6-20250528",
+            coderModel:
+              options.coderModel || "anthropic-newcli/claude-opus-4-6-20250528",
+            reviewerModel:
+              options.reviewerModel ||
+              "anthropic-newcli/claude-opus-4-6-20250528",
+            maxParallel: options.maxParallel || 3,
             language: options.language || "typescript",
             framework: options.framework || "auto",
           };
@@ -1393,12 +1398,16 @@ For each feature:
             githubUrl = match ? match[0] : `https://github.com/${safeRepoName}`;
           } catch (err) {
             if (err.message?.includes("already exists")) {
+              const ghUser = execSync(
+                'gh api user --jq .login 2>/dev/null || echo "unknown"',
+                { encoding: "utf8" },
+              ).trim();
               execSync(
-                `git remote add origin https://github.com/412984588/${safeRepoName}.git 2>/dev/null || git remote set-url origin https://github.com/412984588/${safeRepoName}.git`,
+                `git remote add origin https://github.com/${ghUser}/${safeRepoName}.git 2>/dev/null || git remote set-url origin https://github.com/${ghUser}/${safeRepoName}.git`,
                 { cwd: workdir },
               );
               execSync("git push -u origin HEAD 2>&1", { cwd: workdir });
-              githubUrl = `https://github.com/412984588/${repoName}`;
+              githubUrl = `https://github.com/${ghUser}/${repoName}`;
             } else {
               throw err;
             }
@@ -1862,7 +1871,9 @@ npm test
 `;
 
             // src 目录
-            files["src/index.ts"] =
+            const indexFile =
+              lang === "typescript" ? "src/index.ts" : "src/index.js";
+            files[indexFile] =
               lang === "typescript"
                 ? `export function main() {
   console.log('Hello from ${project.name}!');
@@ -2196,10 +2207,17 @@ Cargo.lock
 
             case "commit":
               execSync("git add -A", { cwd: workdir });
-              output = execSync(
-                `git commit -m "${escapeShellArg(message).slice(1, -1)}"`,
-                { cwd: workdir, encoding: "utf8" },
-              );
+              try {
+                output = execSync(
+                  `git diff --cached --quiet && echo "Nothing to commit" || git commit -m "${escapeShellArg(message).slice(1, -1)}"`,
+                  { cwd: workdir, encoding: "utf8" },
+                );
+              } catch (e) {
+                output =
+                  e.stdout ||
+                  e.stderr ||
+                  "Commit skipped (no changes or hook rejected)";
+              }
               break;
 
             case "pull":
