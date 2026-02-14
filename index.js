@@ -56,8 +56,7 @@ function initDB() {
           review_notes TEXT,
           created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )`);
-        db.run(
-          `CREATE TABLE IF NOT EXISTS runs (
+        db.run(`CREATE TABLE IF NOT EXISTS runs (
           id TEXT PRIMARY KEY,
           project_id TEXT,
           feature_id TEXT,
@@ -68,6 +67,16 @@ function initDB() {
           completed_at DATETIME,
           error TEXT,
           output TEXT
+        )`);
+        db.run(
+          `CREATE TABLE IF NOT EXISTS commits (
+          id TEXT PRIMARY KEY,
+          project_id TEXT,
+          feature_id TEXT,
+          sha TEXT,
+          message TEXT,
+          author TEXT,
+          created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )`,
           [],
           () => resolve(db),
@@ -811,6 +820,10 @@ Provide the complete implementation including:
             type: "boolean",
             description: "Automatically spawn coding agent (default: true)",
           },
+          maxRetries: {
+            type: "number",
+            description: "Max auto-retry attempts on failure (default: 2, P4)",
+          },
         },
         required: ["featureId"],
       },
@@ -819,6 +832,7 @@ Provide the complete implementation including:
         const model = params?.model;
         const timeoutSeconds = params?.timeoutSeconds || 600;
         const shouldAutoSpawn = params?.autoSpawn !== false;
+        const maxRetries = params?.maxRetries ?? 2; // P4: auto-retry
 
         if (!featureId) return { success: false, error: "Missing featureId" };
 
@@ -909,6 +923,11 @@ After implementation:
             `[forge] Implementing ${featureId} with model ${useModel}`,
           );
 
+          // P4: workdir 删除检测
+          if (!fs.existsSync(feature.workdir)) {
+            fs.mkdirSync(feature.workdir, { recursive: true });
+          }
+
           // P0: 真正自动化
           if (shouldAutoSpawn) {
             return {
@@ -931,9 +950,18 @@ After implementation:
                   params: { featureId },
                   resultField: "implementation",
                 },
+                onError:
+                  maxRetries > 0
+                    ? {
+                        tool: "forge_retry",
+                        params: { featureId, model: useModel },
+                        maxRetries,
+                      }
+                    : null,
               },
               task: taskPrompt,
               runId,
+              maxRetries,
               instruction:
                 "Auto-spawning coding agent. Result will be saved via forge_done.",
             };
@@ -1275,6 +1303,36 @@ For each feature:
 
           const options = JSON.parse(project.options || "{}");
           const language = options.language || "typescript";
+
+          // P4: 环境检测
+          let envReady = true;
+          let envError = null;
+          if (language === "typescript" || language === "javascript") {
+            if (!fs.existsSync(path.join(project.workdir, "package.json"))) {
+              envReady = false;
+              envError =
+                "package.json not found - run forge_init_project first";
+            }
+          } else if (language === "go") {
+            if (!fs.existsSync(path.join(project.workdir, "go.mod"))) {
+              envReady = false;
+              envError = "go.mod not found - run forge_init_project first";
+            }
+          } else if (language === "rust") {
+            if (!fs.existsSync(path.join(project.workdir, "Cargo.toml"))) {
+              envReady = false;
+              envError = "Cargo.toml not found - run forge_init_project first";
+            }
+          }
+
+          if (!envReady) {
+            return {
+              success: false,
+              error: "Test environment not ready",
+              envError,
+              workdir: project.workdir,
+            };
+          }
 
           let cmd = testCommand;
           if (!cmd) {
@@ -2282,7 +2340,284 @@ Cargo.lock
     ),
   );
 
+  // ==================== 工具 18: forge_template_save ====================
+  api.registerTool(
+    tool(
+      "forge_template_save",
+      "Save current project config as a reusable template",
+      {
+        type: "object",
+        properties: {
+          projectId: { type: "string" },
+          templateName: {
+            type: "string",
+            description: "Name for the template",
+          },
+          description: { type: "string", description: "Template description" },
+        },
+        required: ["projectId", "templateName"],
+      },
+      async (params) => {
+        const projectId = params?.projectId;
+        const templateName = params?.templateName;
+        const description = params?.description || "";
+
+        if (!projectId || !templateName) {
+          return { success: false, error: "Missing projectId or templateName" };
+        }
+
+        const db = await initDB();
+        try {
+          const project = await get(db, "SELECT * FROM projects WHERE id=?", [
+            projectId,
+          ]);
+          if (!project)
+            return { success: false, error: "Project not found", projectId };
+
+          const features = await all(
+            db,
+            "SELECT id, name, description, priority, dependencies FROM features WHERE project_id=?",
+            [projectId],
+          );
+          const options = JSON.parse(project.options || "{}");
+
+          // 模板目录
+          const templateDir = path.join(
+            process.env.HOME || "/tmp",
+            ".openclaw-gateway",
+            "forge-templates",
+          );
+          if (!fs.existsSync(templateDir)) {
+            fs.mkdirSync(templateDir, { recursive: true });
+          }
+
+          const templateId = templateName
+            .toLowerCase()
+            .replace(/[^a-z0-9-]/g, "-");
+          const template = {
+            id: templateId,
+            name: templateName,
+            description,
+            sourceProject: projectId,
+            sourceProjectName: project.name,
+            options,
+            features: features.map((f) => ({
+              name: f.name,
+              description: f.description,
+              priority: f.priority,
+              dependencies: JSON.parse(f.dependencies || "[]"),
+            })),
+            createdAt: new Date().toISOString(),
+          };
+
+          const templateFile = path.join(templateDir, `${templateId}.json`);
+          fs.writeFileSync(templateFile, JSON.stringify(template, null, 2));
+
+          logger.info?.(`[forge] Template saved: ${templateId}`);
+
+          return {
+            success: true,
+            templateId,
+            templateName,
+            templateFile,
+            featureCount: features.length,
+            options: template.options,
+          };
+        } finally {
+          closeDB(db);
+        }
+      },
+    ),
+  );
+
+  // ==================== 工具 19: forge_template_list ====================
+  api.registerTool(
+    tool(
+      "forge_template_list",
+      "List all saved templates",
+      {
+        type: "object",
+        properties: {},
+      },
+      async (params) => {
+        const templateDir = path.join(
+          process.env.HOME || "/tmp",
+          ".openclaw-gateway",
+          "forge-templates",
+        );
+
+        if (!fs.existsSync(templateDir)) {
+          return { success: true, templates: [], count: 0 };
+        }
+
+        const templates = [];
+        const files = fs
+          .readdirSync(templateDir)
+          .filter((f) => f.endsWith(".json"));
+
+        for (const file of files) {
+          try {
+            const content = JSON.parse(
+              fs.readFileSync(path.join(templateDir, file), "utf8"),
+            );
+            templates.push({
+              id: content.id,
+              name: content.name,
+              description: content.description,
+              featureCount: content.features?.length || 0,
+              language: content.options?.language,
+              framework: content.options?.framework,
+              createdAt: content.createdAt,
+            });
+          } catch {}
+        }
+
+        return {
+          success: true,
+          templates,
+          count: templates.length,
+          templateDir,
+        };
+      },
+    ),
+  );
+
+  // ==================== 工具 20: forge_template_load ====================
+  api.registerTool(
+    tool(
+      "forge_template_load",
+      "Create a new project from a template",
+      {
+        type: "object",
+        properties: {
+          templateId: { type: "string" },
+          projectName: {
+            type: "string",
+            description: "Name for the new project",
+          },
+          prd: {
+            type: "string",
+            description: "Additional PRD content (optional)",
+          },
+          options: { type: "object", description: "Override options" },
+        },
+        required: ["templateId", "projectName"],
+      },
+      async (params) => {
+        const templateId = params?.templateId;
+        const projectName = params?.projectName;
+        const extraPrd = params?.prd || "";
+        const overrideOptions = params?.options || {};
+
+        if (!templateId || !projectName) {
+          return { success: false, error: "Missing templateId or projectName" };
+        }
+
+        const templateDir = path.join(
+          process.env.HOME || "/tmp",
+          ".openclaw-gateway",
+          "forge-templates",
+        );
+        const templateFile = path.join(templateDir, `${templateId}.json`);
+
+        if (!fs.existsSync(templateFile)) {
+          return { success: false, error: "Template not found", templateId };
+        }
+
+        let template;
+        try {
+          template = JSON.parse(fs.readFileSync(templateFile, "utf8"));
+        } catch {
+          return { success: false, error: "Invalid template file", templateId };
+        }
+
+        // 合并选项
+        const mergedOptions = { ...template.options, ...overrideOptions };
+
+        // 构建 PRD
+        let prdContent = `# ${projectName}\n\n`;
+        prdContent += `Template: ${template.name}\n\n`;
+        if (template.description) {
+          prdContent += `## Overview\n${template.description}\n\n`;
+        }
+        if (extraPrd) {
+          prdContent += `${extraPrd}\n\n`;
+        }
+        prdContent += `## Features\n\n`;
+
+        template.features.forEach((f, i) => {
+          const idx = String(i + 1).padStart(3, "0");
+          prdContent += `### Feature ${idx}: ${f.name}\n`;
+          prdContent += `- **描述**: ${f.description}\n`;
+          prdContent += `- **优先级**: P${f.priority}\n`;
+          if (f.dependencies && f.dependencies.length > 0) {
+            prdContent += `- **依赖**: ${f.dependencies.join(", ")}\n`;
+          } else {
+            prdContent += `- **依赖**: 无\n`;
+          }
+          prdContent += `\n`;
+        });
+
+        const db = await initDB();
+        try {
+          const projectId = `proj-${Date.now()}`;
+          const workdir = path.join(PROJECTS_DIR, projectId);
+          fs.mkdirSync(workdir, { recursive: true });
+          fs.writeFileSync(path.join(workdir, "PRD.md"), prdContent);
+
+          await run(
+            db,
+            `INSERT INTO projects (id, name, prd, status, workdir, options) VALUES (?,?,?,?,?,?)`,
+            [
+              projectId,
+              projectName,
+              prdContent,
+              "initialized",
+              workdir,
+              JSON.stringify(mergedOptions),
+            ],
+          );
+
+          const parsed = parsePRD(prdContent);
+          for (const f of parsed.features) {
+            await run(
+              db,
+              `INSERT INTO features (id, project_id, name, description, priority, status, dependencies) VALUES (?,?,?,?,?,?,?)`,
+              [
+                f.id,
+                projectId,
+                f.name,
+                f.description,
+                f.priority,
+                "pending",
+                JSON.stringify(f.dependencies),
+              ],
+            );
+          }
+
+          logger.info?.(
+            `[forge] Project created from template ${templateId}: ${projectId}`,
+          );
+
+          return {
+            success: true,
+            projectId,
+            projectName,
+            templateId,
+            templateName: template.name,
+            featureCount: parsed.features.length,
+            workdir,
+            options: mergedOptions,
+            nextStep: "Run forge_plan to design the architecture",
+          };
+        } finally {
+          closeDB(db);
+        }
+      },
+    ),
+  );
+
   logger.info?.(
-    "[forge] Extension loaded v2.2 - Full PRD → Code Automation (P0-P3 complete)",
+    "[forge] Extension loaded v2.4 - Full PRD → Code Automation (with Templates)",
   );
 }
