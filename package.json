@@ -1,0 +1,10 @@
+{
+  "name": "autoforge-extension",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "PRD to production code automation extension",
+  "main": "index.js",
+  "dependencies": {
+    "sqlite3": "^5.1.6"
+  }
+}

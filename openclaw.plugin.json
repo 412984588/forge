@@ -1,0 +1,17 @@
+{
+  "id": "autoforge",
+  "name": "AutoForge",
+  "description": "PRD → Production Code Automation",
+  "version": "1.0.0",
+  "repository": "local:autoforge",
+  "entry": "./index.js",
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "defaultArchitectModel": { "type": "string" },
+      "defaultCoderModel": { "type": "string" },
+      "defaultReviewerModel": { "type": "string" },
+      "defaultMaxParallel": { "type": "number", "default": 3 }
+    }
+  }
+}
