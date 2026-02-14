@@ -291,20 +291,85 @@ function escapeShellArg(str) {
   return "'" + String(str).replace(/'/g, "'\\''") + "'";
 }
 
+// P5: 统一错误处理 - 带错误码和修复建议
+const ERROR_CODES = {
+  MISSING_PARAM: {
+    code: "E001",
+    suggestion: "Check required parameters in tool schema",
+  },
+  NOT_FOUND: {
+    code: "E002",
+    suggestion: "Verify the ID exists using forge_status or forge_next",
+  },
+  INVALID_STATE: {
+    code: "E003",
+    suggestion: "Check current status before this operation",
+  },
+  CIRCULAR_DEP: {
+    code: "E004",
+    suggestion: "Remove circular dependencies in PRD feature definitions",
+  },
+  ENV_NOT_READY: {
+    code: "E005",
+    suggestion: "Run forge_init_project first to create project structure",
+  },
+  PERMISSION: {
+    code: "E006",
+    suggestion: "Check file permissions or run with appropriate privileges",
+  },
+  GIT_ERROR: {
+    code: "E007",
+    suggestion: "Ensure git is installed and repository is valid",
+  },
+  TIMEOUT: {
+    code: "E008",
+    suggestion: "Increase timeoutSeconds parameter or check network",
+  },
+};
+
+function error(type, message, extra = {}) {
+  const errInfo = ERROR_CODES[type] || {
+    code: "E999",
+    suggestion: "Check logs for details",
+  };
+  return {
+    success: false,
+    errorCode: errInfo.code,
+    error: message,
+    suggestion: errInfo.suggestion,
+    timestamp: new Date().toISOString(),
+    ...extra,
+  };
+}
+
 function tool(name, description, parameters, handler) {
   return {
     name,
     description,
     parameters,
     execute: async (_toolCallId, params) => {
+      const startTime = Date.now();
       try {
         const p = params && typeof params === "object" ? params : {};
-        return await handler(p);
+        const result = await handler(p);
+        // P5: 添加执行时间
+        if (result && typeof result === "object") {
+          result._meta = {
+            tool: name,
+            durationMs: Date.now() - startTime,
+            timestamp: new Date().toISOString(),
+          };
+        }
+        return result;
       } catch (err) {
         return {
           success: false,
+          errorCode: "E999",
           error: err?.message || String(err),
           tool: name,
+          suggestion: "Check logs for details",
+          timestamp: new Date().toISOString(),
+          durationMs: Date.now() - startTime,
         };
       }
     },
@@ -2618,6 +2683,6 @@ Cargo.lock
   );
 
   logger.info?.(
-    "[forge] Extension loaded v2.4 - Full PRD → Code Automation (with Templates)",
+    "[forge] Extension loaded v2.5.0 - Full PRD → Code Automation (Enhanced Errors)",
   );
 }
