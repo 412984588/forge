@@ -10,8 +10,9 @@
 
 import fs from "fs";
 import path from "path";
-import { execSync } from "child_process";
+import { exec } from "child_process";
 import sqlite3pkg from "sqlite3";
+import { WebSocketServer } from "ws";
 
 const sqlite3 = sqlite3pkg.verbose();
 const DB_PATH = path.join(
@@ -22,8 +23,31 @@ const DB_PATH = path.join(
 const PROJECTS_DIR = path.join(process.env.HOME || "/tmp", "forge-projects");
 const DEFAULT_MODEL =
   process.env.FORGE_MODEL || "anthropic-newcli/claude-opus-4-6-20250528";
+const DB_POOL_MAX = Math.max(1, Number(process.env.FORGE_DB_POOL_MAX || 4));
+const STATUS_CACHE_LIMIT = Math.max(
+  16,
+  Number(process.env.FORGE_STATUS_CACHE_LIMIT || 256),
+);
+const STATUS_CACHE_TTL_MS = Math.max(
+  100,
+  Number(process.env.FORGE_STATUS_CACHE_TTL_MS || 2000),
+);
+const RATE_LIMIT_MAX = Math.max(
+  1,
+  Number(process.env.FORGE_RATE_LIMIT_MAX || 120),
+);
+const RATE_LIMIT_WINDOW_MS = Math.max(
+  1000,
+  Number(process.env.FORGE_RATE_LIMIT_WINDOW_MS || 60_000),
+);
+const WS_PORT = Math.max(1024, Number(process.env.FORGE_WS_PORT || 17345));
 
-// P2: 安全的 JSON 解析
+/**
+ * 安全解析 JSON，失败时返回 fallback。
+ * @param {string} str
+ * @param {any} fallback
+ * @returns {any}
+ */
 function safeJSONParse(str, fallback = null) {
   try {
     return JSON.parse(str);
@@ -40,109 +64,235 @@ function safeJSONParse(str, fallback = null) {
 
 // 确保 DB 目录存在
 const DB_DIR = path.dirname(DB_PATH);
+const AUDIT_LOG_PATH = path.join(DB_DIR, "forge-audit.log");
 if (!fs.existsSync(DB_DIR)) {
   fs.mkdirSync(DB_DIR, { recursive: true });
 }
 
-// P1: 数据库连接池（单例）
-let dbInstance = null;
+const dbPool = {
+  max: DB_POOL_MAX,
+  available: [],
+  waiters: [],
+  inUse: 0,
+  creating: 0,
+};
 
-function initDB() {
-  if (dbInstance) return Promise.resolve(dbInstance);
+let wsState = { started: false, server: null, clients: new Set(), url: null };
 
+/**
+ * 初始化数据库 schema。
+ * @param {import('sqlite3').Database} db
+ * @returns {Promise<void>}
+ */
+function ensureSchema(db) {
+  const schemaSQL = [
+    `CREATE TABLE IF NOT EXISTS projects (
+      id TEXT PRIMARY KEY,
+      name TEXT,
+      prd TEXT,
+      architecture TEXT,
+      status TEXT,
+      github_url TEXT,
+      workdir TEXT,
+      options TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`,
+    `CREATE TABLE IF NOT EXISTS features (
+      id TEXT PRIMARY KEY,
+      project_id TEXT,
+      name TEXT,
+      description TEXT,
+      priority INTEGER,
+      status TEXT,
+      dependencies TEXT,
+      assigned_model TEXT,
+      implementation TEXT,
+      review_notes TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`,
+    `CREATE TABLE IF NOT EXISTS runs (
+      id TEXT PRIMARY KEY,
+      project_id TEXT,
+      feature_id TEXT,
+      tool TEXT,
+      status TEXT,
+      model TEXT,
+      started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      completed_at DATETIME,
+      error TEXT,
+      output TEXT
+    )`,
+    `CREATE TABLE IF NOT EXISTS commits (
+      id TEXT PRIMARY KEY,
+      project_id TEXT,
+      feature_id TEXT,
+      sha TEXT,
+      message TEXT,
+      author TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`,
+    `CREATE TABLE IF NOT EXISTS file_index (
+      project_id TEXT,
+      rel_path TEXT,
+      fingerprint TEXT,
+      indexed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (project_id, rel_path)
+    )`,
+    `CREATE TABLE IF NOT EXISTS audit_logs (
+      id TEXT PRIMARY KEY,
+      tool TEXT,
+      phase TEXT,
+      success INTEGER,
+      payload TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_features_project ON features(project_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_features_status ON features(status)`,
+    `CREATE INDEX IF NOT EXISTS idx_runs_project ON runs(project_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status)`,
+  ];
   return new Promise((resolve, reject) => {
-    const db = new sqlite3.Database(DB_PATH, (err) => {
-      if (err) return reject(err);
-      dbInstance = db;
-      db.serialize(() => {
-        db.run(`CREATE TABLE IF NOT EXISTS projects (
-          id TEXT PRIMARY KEY,
-          name TEXT,
-          prd TEXT,
-          architecture TEXT,
-          status TEXT,
-          github_url TEXT,
-          workdir TEXT,
-          options TEXT,
-          created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )`);
-        db.run(`CREATE TABLE IF NOT EXISTS features (
-          id TEXT PRIMARY KEY,
-          project_id TEXT,
-          name TEXT,
-          description TEXT,
-          priority INTEGER,
-          status TEXT,
-          dependencies TEXT,
-          assigned_model TEXT,
-          implementation TEXT,
-          review_notes TEXT,
-          created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )`);
-        db.run(`CREATE TABLE IF NOT EXISTS runs (
-          id TEXT PRIMARY KEY,
-          project_id TEXT,
-          feature_id TEXT,
-          tool TEXT,
-          status TEXT,
-          model TEXT,
-          started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-          completed_at DATETIME,
-          error TEXT,
-          output TEXT
-        )`);
-        db.run(`CREATE TABLE IF NOT EXISTS commits (
-          id TEXT PRIMARY KEY,
-          project_id TEXT,
-          feature_id TEXT,
-          sha TEXT,
-          message TEXT,
-          author TEXT,
-          created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )`);
-        // P3: 性能优化 - 添加索引
-        db.run(
-          `CREATE INDEX IF NOT EXISTS idx_features_project ON features(project_id)`,
-        );
-        db.run(
-          `CREATE INDEX IF NOT EXISTS idx_features_status ON features(status)`,
-        );
-        db.run(
-          `CREATE INDEX IF NOT EXISTS idx_runs_project ON runs(project_id)`,
-        );
-        db.run(
-          `CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status)`,
-          [],
-          () => resolve(db),
-        );
-      });
+    db.serialize(() => {
+      let i = 0;
+      const next = () => {
+        if (i >= schemaSQL.length) {
+          resolve();
+          return;
+        }
+        db.run(schemaSQL[i], [], (err) => {
+          if (err) {
+            reject(err);
+            return;
+          }
+          i += 1;
+          next();
+        });
+      };
+      next();
     });
   });
 }
 
-function closeDB(db) {
-  try {
-    db.close();
-  } catch (err) {
-    console.error("[forge] DB close error:", err);
-  }
+/**
+ * 创建新的数据库连接并初始化 schema。
+ * @returns {Promise<import('sqlite3').Database>}
+ */
+function createDBConnection() {
+  return new Promise((resolve, reject) => {
+    const db = new sqlite3.Database(DB_PATH, async (err) => {
+      if (err) {
+        reject(err);
+        return;
+      }
+      try {
+        await ensureSchema(db);
+        resolve(db);
+      } catch (schemaErr) {
+        reject(schemaErr);
+      }
+    });
+  });
 }
 
+/**
+ * 从连接池获取连接。
+ * @returns {Promise<import('sqlite3').Database>}
+ */
+async function initDB() {
+  if (dbPool.available.length > 0) {
+    dbPool.inUse += 1;
+    return dbPool.available.pop();
+  }
+
+  if (dbPool.inUse + dbPool.creating < dbPool.max) {
+    dbPool.creating += 1;
+    try {
+      const db = await createDBConnection();
+      dbPool.inUse += 1;
+      return db;
+    } finally {
+      dbPool.creating -= 1;
+    }
+  }
+
+  return new Promise((resolve) => {
+    dbPool.waiters.push(resolve);
+  });
+}
+
+/**
+ * 归还数据库连接到连接池。
+ * @param {import('sqlite3').Database} db
+ * @returns {void}
+ */
+function closeDB(db) {
+  if (!db) return;
+  if (dbPool.waiters.length > 0) {
+    const waiter = dbPool.waiters.shift();
+    waiter(db);
+    return;
+  }
+  dbPool.inUse = Math.max(0, dbPool.inUse - 1);
+  dbPool.available.push(db);
+}
+
+function shutdownDBPool() {
+  for (const db of dbPool.available) {
+    try {
+      db.close();
+    } catch {}
+  }
+  dbPool.available = [];
+}
+
+process.once("exit", shutdownDBPool);
+
+/**
+ * 执行写操作 SQL。
+ * @param {import('sqlite3').Database} db
+ * @param {string} sql
+ * @param {any[]} params
+ * @returns {Promise<{changes: number, lastID: number}>}
+ */
 function run(db, sql, params = []) {
   return new Promise((resolve, reject) => {
     db.run(sql, params, function (err) {
-      if (err) reject(err);
-      else resolve({ changes: this.changes, lastID: this.lastID });
+      if (err) {
+        reject(err);
+        return;
+      }
+      if (
+        /\b(INSERT|UPDATE|DELETE|REPLACE)\b/i.test(sql) &&
+        /\b(projects|features|runs|file_index)\b/i.test(sql)
+      ) {
+        statusCache.clear();
+        broadcastProgress({ type: "forge_status_invalidate" });
+      }
+      resolve({ changes: this.changes, lastID: this.lastID });
     });
   });
 }
 
+/**
+ * 执行单行查询 SQL。
+ * @param {import('sqlite3').Database} db
+ * @param {string} sql
+ * @param {any[]} params
+ * @returns {Promise<any>}
+ */
 function get(db, sql, params = []) {
   return new Promise((resolve, reject) => {
     db.get(sql, params, (err, row) => (err ? reject(err) : resolve(row)));
   });
 }
 
+/**
+ * 执行多行查询 SQL。
+ * @param {import('sqlite3').Database} db
+ * @param {string} sql
+ * @param {any[]} params
+ * @returns {Promise<any[]>}
+ */
 function all(db, sql, params = []) {
   return new Promise((resolve, reject) => {
     db.all(sql, params, (err, rows) =>
@@ -151,7 +301,11 @@ function all(db, sql, params = []) {
   });
 }
 
-// 检测循环依赖（拓扑排序）
+/**
+ * 检测特性依赖中的循环依赖。
+ * @param {Array<{id: string, dependencies: string | string[]}>} features
+ * @returns {boolean}
+ */
 function detectCycle(features) {
   const graph = {};
   const visited = new Set();
@@ -186,7 +340,11 @@ function detectCycle(features) {
   return false;
 }
 
-// 验证依赖 ID 是否存在
+/**
+ * 验证依赖 ID 是否都存在。
+ * @param {Array<{id: string, dependencies: string | string[]}>} features
+ * @returns {string[]}
+ */
 function validateDependencies(features) {
   const ids = new Set(features.map((f) => f.id));
   const errors = [];
@@ -203,6 +361,11 @@ function validateDependencies(features) {
   return errors;
 }
 
+/**
+ * 将 PRD 文本解析为项目与 feature 列表。
+ * @param {string} prdContent
+ * @returns {{name: string, overview: string, features: any[], techStack: string[]}}
+ */
 function parsePRD(prdContent) {
   // P1: 输入验证
   if (prdContent === null || prdContent === undefined) {
@@ -332,12 +495,16 @@ function parsePRD(prdContent) {
   return project;
 }
 
+/**
+ * 对 shell 参数进行单引号转义。
+ * @param {string} str
+ * @returns {string}
+ */
 function escapeShellArg(str) {
   if (!str) return "''";
   return "'" + String(str).replace(/'/g, "'\\''") + "'";
 }
 
-// P5: 统一错误处理 - 带错误码和修复建议
 const ERROR_CODES = {
   MISSING_PARAM: {
     code: "E001",
@@ -371,8 +538,23 @@ const ERROR_CODES = {
     code: "E008",
     suggestion: "Increase timeoutSeconds parameter or check network",
   },
+  RATE_LIMIT: {
+    code: "E009",
+    suggestion: "Retry later or lower request frequency",
+  },
+  INVALID_INPUT: {
+    code: "E010",
+    suggestion: "Check input whitelist and parameter format",
+  },
 };
 
+/**
+ * 构造标准错误返回格式。
+ * @param {string} type
+ * @param {string} message
+ * @param {Record<string, unknown>} [extra]
+ * @returns {Record<string, unknown>}
+ */
 function error(type, message, extra = {}) {
   const errInfo = ERROR_CODES[type] || {
     code: "E999",
@@ -388,6 +570,418 @@ function error(type, message, extra = {}) {
   };
 }
 
+/**
+ * 简单 LRU 缓存（支持 TTL）。
+ */
+class LRUCache {
+  constructor(limit = 128, ttlMs = 2_000) {
+    this.limit = limit;
+    this.ttlMs = ttlMs;
+    this.map = new Map();
+  }
+
+  get(key) {
+    const hit = this.map.get(key);
+    if (!hit) return undefined;
+    if (Date.now() > hit.expiresAt) {
+      this.map.delete(key);
+      return undefined;
+    }
+    this.map.delete(key);
+    this.map.set(key, hit);
+    return hit.value;
+  }
+
+  set(key, value) {
+    if (this.map.has(key)) {
+      this.map.delete(key);
+    }
+    this.map.set(key, { value, expiresAt: Date.now() + this.ttlMs });
+    while (this.map.size > this.limit) {
+      const firstKey = this.map.keys().next().value;
+      this.map.delete(firstKey);
+    }
+  }
+
+  clear() {
+    this.map.clear();
+  }
+}
+
+/**
+ * 固定窗口速率限制器。
+ */
+class RateLimiter {
+  constructor({ limit, windowMs }) {
+    this.limit = limit;
+    this.windowMs = windowMs;
+    this.counters = new Map();
+  }
+
+  consume(key) {
+    const now = Date.now();
+    const hit = this.counters.get(key);
+    if (!hit || now >= hit.resetAt) {
+      this.counters.set(key, { count: 1, resetAt: now + this.windowMs });
+      return true;
+    }
+    if (hit.count >= this.limit) {
+      return false;
+    }
+    hit.count += 1;
+    return true;
+  }
+}
+
+const statusCache = new LRUCache(STATUS_CACHE_LIMIT, STATUS_CACHE_TTL_MS);
+const rateLimiter = new RateLimiter({
+  limit: RATE_LIMIT_MAX,
+  windowMs: RATE_LIMIT_WINDOW_MS,
+});
+
+const ID_PATTERN = /^[a-zA-Z0-9._:-]{1,128}$/;
+const NAME_PATTERN = /^[a-zA-Z0-9._@/: -]{1,200}$/;
+const SAFE_TEXT_PATTERN = /^[\s\S]{0,200000}$/;
+const ALLOWED_LANGUAGES = new Set([
+  "typescript",
+  "javascript",
+  "python",
+  "go",
+  "rust",
+  "swift",
+  "kotlin",
+]);
+const ALLOWED_GIT_ACTIONS = new Set([
+  "init",
+  "status",
+  "commit",
+  "pull",
+  "branch",
+  "merge",
+  "log",
+]);
+
+/**
+ * 推断错误类型。
+ * @param {string} message
+ * @returns {string}
+ */
+function inferErrorType(message) {
+  const lower = String(message || "").toLowerCase();
+  if (lower.includes("missing")) return "MISSING_PARAM";
+  if (lower.includes("not found")) return "NOT_FOUND";
+  if (lower.includes("timeout")) return "TIMEOUT";
+  if (lower.includes("permission")) return "PERMISSION";
+  if (lower.includes("invalid")) return "INVALID_INPUT";
+  return "INVALID_STATE";
+}
+
+/**
+ * 标准化 handler 的失败返回。
+ * @param {any} result
+ * @returns {any}
+ */
+function normalizeErrorResult(result) {
+  if (
+    !result ||
+    typeof result !== "object" ||
+    result.success !== false ||
+    result.errorCode
+  ) {
+    return result;
+  }
+  const normalized = error(
+    inferErrorType(result.error),
+    result.error || "Unknown error",
+    result,
+  );
+  return { ...result, ...normalized };
+}
+
+/**
+ * 执行 shell 命令（异步，非阻塞事件循环）。
+ * @param {string} cmd
+ * @param {{cwd?: string, timeoutMs?: number}} [options]
+ * @returns {Promise<{ok: boolean, stdout: string, stderr: string, code: number | null, error: Error | null}>}
+ */
+function runCommand(cmd, options = {}) {
+  const { cwd, timeoutMs = 120_000 } = options;
+  return new Promise((resolve) => {
+    exec(
+      cmd,
+      {
+        cwd,
+        timeout: timeoutMs,
+        maxBuffer: 10 * 1024 * 1024,
+        env: process.env,
+      },
+      (err, stdout, stderr) => {
+        if (err) {
+          resolve({
+            ok: false,
+            stdout: stdout || "",
+            stderr: stderr || "",
+            code: typeof err.code === "number" ? err.code : null,
+            error: err,
+          });
+          return;
+        }
+        resolve({
+          ok: true,
+          stdout: stdout || "",
+          stderr: stderr || "",
+          code: 0,
+          error: null,
+        });
+      },
+    );
+  });
+}
+
+/**
+ * 入参白名单验证。
+ * @param {string} toolName
+ * @param {Record<string, any>} params
+ * @returns {{valid: true} | {valid: false, error: string}}
+ */
+function validateToolParams(toolName, params) {
+  const check = (value, pattern, field) => {
+    if (value == null) return null;
+    if (typeof value !== "string" || !pattern.test(value)) {
+      return `Invalid ${field} format`;
+    }
+    return null;
+  };
+
+  const idFields = ["projectId", "featureId", "templateId"];
+  for (const field of idFields) {
+    const errMsg = check(params[field], ID_PATTERN, field);
+    if (errMsg) return { valid: false, error: errMsg };
+  }
+  const commonFields = [
+    "repoName",
+    "branch",
+    "action",
+    "language",
+    "framework",
+    "name",
+    "templateName",
+  ];
+  for (const field of commonFields) {
+    if (params[field] == null) continue;
+    const errMsg = check(params[field], NAME_PATTERN, field);
+    if (errMsg) return { valid: false, error: errMsg };
+  }
+  if (typeof params.prd === "string" && !SAFE_TEXT_PATTERN.test(params.prd)) {
+    return { valid: false, error: "Invalid prd content length" };
+  }
+  if (
+    toolName === "forge_init_project" &&
+    params.language &&
+    !ALLOWED_LANGUAGES.has(params.language)
+  ) {
+    return { valid: false, error: "Unsupported language" };
+  }
+  if (
+    toolName === "forge_git" &&
+    params.action &&
+    !ALLOWED_GIT_ACTIONS.has(params.action)
+  ) {
+    return { valid: false, error: "Unsupported git action" };
+  }
+  return { valid: true };
+}
+
+function sanitizeAuditValue(value) {
+  if (value == null) return value;
+  if (typeof value === "string") {
+    return value.length > 300 ? `${value.slice(0, 300)}...` : value;
+  }
+  if (Array.isArray(value)) {
+    return value.slice(0, 20).map((item) => sanitizeAuditValue(item));
+  }
+  if (typeof value === "object") {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) {
+      out[k] = sanitizeAuditValue(v);
+    }
+    return out;
+  }
+  return value;
+}
+
+/**
+ * 记录审计日志到本地 JSONL 文件。
+ * @param {Record<string, any>} payload
+ * @returns {Promise<void>}
+ */
+async function writeAuditLog(payload) {
+  const line = `${JSON.stringify({ ...payload, ts: new Date().toISOString() })}\n`;
+  await fs.promises.appendFile(AUDIT_LOG_PATH, line, "utf8");
+}
+
+function ensureWebSocketServer(logger = console) {
+  if (wsState.started) return wsState.url;
+  try {
+    const server = new WebSocketServer({ port: WS_PORT });
+    wsState.started = true;
+    wsState.server = server;
+    wsState.url = `ws://127.0.0.1:${WS_PORT}`;
+    server.on("connection", (socket) => {
+      wsState.clients.add(socket);
+      socket.send(
+        JSON.stringify({
+          type: "forge_connected",
+          ts: new Date().toISOString(),
+        }),
+      );
+      socket.on("close", () => wsState.clients.delete(socket));
+      socket.on("error", () => wsState.clients.delete(socket));
+    });
+    logger.info?.(
+      `[forge] WebSocket progress server started at ${wsState.url}`,
+    );
+    return wsState.url;
+  } catch (err) {
+    logger.warn?.(`[forge] WebSocket disabled: ${err.message}`);
+    return null;
+  }
+}
+
+function broadcastProgress(event) {
+  if (!wsState.started || wsState.clients.size === 0) return;
+  const payload = JSON.stringify({ ...event, ts: new Date().toISOString() });
+  for (const socket of wsState.clients) {
+    try {
+      socket.send(payload);
+    } catch {
+      wsState.clients.delete(socket);
+    }
+  }
+}
+
+const INDEX_IGNORE_DIRS = new Set([
+  ".git",
+  "node_modules",
+  "dist",
+  "build",
+  "target",
+  ".next",
+  ".venv",
+]);
+
+async function walkProjectFiles(rootDir, currentDir = rootDir, acc = []) {
+  const entries = await fs.promises.readdir(currentDir, {
+    withFileTypes: true,
+  });
+  for (const entry of entries) {
+    const abs = path.join(currentDir, entry.name);
+    const rel = path.relative(rootDir, abs);
+    if (entry.isDirectory()) {
+      if (!INDEX_IGNORE_DIRS.has(entry.name)) {
+        await walkProjectFiles(rootDir, abs, acc);
+      }
+      continue;
+    }
+    const stat = await fs.promises.stat(abs);
+    acc.push({ relPath: rel, mtimeMs: stat.mtimeMs, size: stat.size });
+  }
+  return acc;
+}
+
+function fileFingerprint(file) {
+  return `${Math.trunc(file.mtimeMs)}:${file.size}`;
+}
+
+/**
+ * 计算增量变更。
+ * @param {() => Promise<Array<{relPath: string, mtimeMs: number, size: number}>>} walkFn
+ * @param {Map<string, string>} previousState
+ * @returns {Promise<{changed: string[], removed: string[], current: Map<string, string>}>}
+ */
+async function computeIncrementalChanges(walkFn, previousState) {
+  const files = await walkFn();
+  const current = new Map();
+  const changed = [];
+  for (const file of files) {
+    const fp = fileFingerprint(file);
+    current.set(file.relPath, fp);
+    if (previousState.get(file.relPath) !== fp) {
+      changed.push(file.relPath);
+    }
+  }
+  const removed = [];
+  for (const prevKey of previousState.keys()) {
+    if (!current.has(prevKey)) {
+      removed.push(prevKey);
+    }
+  }
+  return { changed, removed, current };
+}
+
+async function loadIndexState(db, projectId) {
+  const rows = await all(
+    db,
+    "SELECT rel_path, fingerprint FROM file_index WHERE project_id=?",
+    [projectId],
+  );
+  const map = new Map();
+  rows.forEach((row) => map.set(row.rel_path, row.fingerprint));
+  return map;
+}
+
+async function persistIncrementalState(
+  db,
+  projectId,
+  changed,
+  removed,
+  current,
+) {
+  for (const relPath of changed) {
+    const fingerprint = current.get(relPath);
+    await run(
+      db,
+      `INSERT INTO file_index (project_id, rel_path, fingerprint, indexed_at)
+       VALUES (?,?,?,CURRENT_TIMESTAMP)
+       ON CONFLICT(project_id, rel_path) DO UPDATE SET fingerprint=excluded.fingerprint, indexed_at=CURRENT_TIMESTAMP`,
+      [projectId, relPath, fingerprint],
+    );
+  }
+  for (const relPath of removed) {
+    await run(db, "DELETE FROM file_index WHERE project_id=? AND rel_path=?", [
+      projectId,
+      relPath,
+    ]);
+  }
+}
+
+async function incrementalIndexProject(db, projectId, workdir) {
+  if (!workdir || !fs.existsSync(workdir)) {
+    return { changed: [], removed: [] };
+  }
+  const previous = await loadIndexState(db, projectId);
+  const diff = await computeIncrementalChanges(
+    () => walkProjectFiles(workdir),
+    previous,
+  );
+  await persistIncrementalState(
+    db,
+    projectId,
+    diff.changed,
+    diff.removed,
+    diff.current,
+  );
+  return { changed: diff.changed, removed: diff.removed };
+}
+
+/**
+ * 构造统一包装后的工具定义（限流、审计、输入校验、错误标准化）。
+ * @param {string} name
+ * @param {string} description
+ * @param {Record<string, any>} parameters
+ * @param {(params: Record<string, any>) => Promise<any>} handler
+ * @returns {{name: string, description: string, parameters: any, execute: Function}}
+ */
 function tool(name, description, parameters, handler) {
   return {
     name,
@@ -397,8 +991,22 @@ function tool(name, description, parameters, handler) {
       const startTime = Date.now();
       try {
         const p = params && typeof params === "object" ? params : {};
-        const result = await handler(p);
-        // P5: 添加执行时间
+        const validation = validateToolParams(name, p);
+        if (!validation.valid) {
+          return error("INVALID_INPUT", validation.error, { tool: name });
+        }
+        if (!rateLimiter.consume(name)) {
+          return error("RATE_LIMIT", `Rate limit exceeded for ${name}`, {
+            tool: name,
+          });
+        }
+        writeAuditLog({
+          id: `audit-${Date.now()}`,
+          tool: name,
+          phase: "start",
+          payload: sanitizeAuditValue(p),
+        }).catch(() => {});
+        const result = normalizeErrorResult(await handler(p));
         if (result && typeof result === "object") {
           result._meta = {
             tool: name,
@@ -406,24 +1014,39 @@ function tool(name, description, parameters, handler) {
             timestamp: new Date().toISOString(),
           };
         }
+        writeAuditLog({
+          id: `audit-${Date.now()}-${Math.random()}`,
+          tool: name,
+          phase: "end",
+          success: result?.success !== false ? 1 : 0,
+          payload: sanitizeAuditValue(result),
+        }).catch(() => {});
+        broadcastProgress({
+          type: "forge_progress",
+          tool: name,
+          success: result?.success !== false,
+          projectId: result?.projectId || p?.projectId || null,
+          featureId: result?.featureId || p?.featureId || null,
+        });
         return result;
       } catch (err) {
-        return {
-          success: false,
-          errorCode: "E999",
-          error: err?.message || String(err),
+        return error("INVALID_STATE", err?.message || String(err), {
           tool: name,
-          suggestion: "Check logs for details",
-          timestamp: new Date().toISOString(),
           durationMs: Date.now() - startTime,
-        };
+        });
       }
     },
   };
 }
 
+/**
+ * 注册 Forge 全量工具。
+ * @param {{registerTool: Function, logger?: Console}} api
+ * @returns {void}
+ */
 export default function register(api) {
   const logger = api.logger || console;
+  const wsUrl = ensureWebSocketServer(logger);
 
   // ==================== 工具 1: forge_init ====================
   api.registerTool(
@@ -1123,7 +1746,7 @@ After implementation:
         try {
           const existing = await get(
             db,
-            "SELECT f.*, p.id as project_id FROM features f JOIN projects p ON f.project_id = p.id WHERE f.id=?",
+            "SELECT f.*, p.id as project_id, p.workdir FROM features f JOIN projects p ON f.project_id = p.id WHERE f.id=?",
             [featureId],
           );
           if (!existing)
@@ -1143,6 +1766,11 @@ After implementation:
             ["success", new Date().toISOString(), featureId, "running"],
           );
 
+          const indexDiff = await incrementalIndexProject(
+            db,
+            existing.project_id,
+            existing.workdir,
+          );
           const remaining = await all(
             db,
             "SELECT id FROM features WHERE project_id=? AND status!=?",
@@ -1158,6 +1786,11 @@ After implementation:
             status: "complete",
             implementation,
             wasAlreadyComplete: wasComplete,
+            indexed: {
+              changedFiles: indexDiff.changed.length,
+              removedFiles: indexDiff.removed.length,
+              changed: indexDiff.changed,
+            },
             remainingFeatures: remaining.length,
             allComplete: remaining.length === 0,
             nextStep:
@@ -1191,6 +1824,18 @@ After implementation:
 
         if (!projectId) return { success: false, error: "Missing projectId" };
 
+        const cacheKey = `forge_status:${projectId}:${detailed ? "1" : "0"}`;
+        const cached = statusCache.get(cacheKey);
+        if (cached) {
+          return {
+            ...cached,
+            _cache: { hit: true, key: cacheKey },
+            websocket: wsUrl
+              ? { enabled: true, url: wsUrl }
+              : { enabled: false },
+          };
+        }
+
         const db = await initDB();
         try {
           const project = await get(db, "SELECT * FROM projects WHERE id=?", [
@@ -1222,7 +1867,7 @@ After implementation:
           counts.forEach((c) => (statusMap[c.status] = c.count));
           const total = Object.values(statusMap).reduce((a, b) => a + b, 0);
 
-          return {
+          const result = {
             success: true,
             project: {
               id: project.id,
@@ -1246,7 +1891,12 @@ After implementation:
             featureCounts: counts,
             features: allFeatures,
             recentRuns: runs,
+            websocket: wsUrl
+              ? { enabled: true, url: wsUrl }
+              : { enabled: false },
           };
+          statusCache.set(cacheKey, result);
+          return { ...result, _cache: { hit: false, key: cacheKey } };
         } finally {
           closeDB(db);
         }
@@ -1438,6 +2088,20 @@ For each feature:
               envReady = false;
               envError = "Cargo.toml not found - run forge_init_project first";
             }
+          } else if (language === "swift") {
+            if (!fs.existsSync(path.join(project.workdir, "Package.swift"))) {
+              envReady = false;
+              envError =
+                "Package.swift not found - run forge_init_project first";
+            }
+          } else if (language === "kotlin") {
+            if (
+              !fs.existsSync(path.join(project.workdir, "build.gradle.kts"))
+            ) {
+              envReady = false;
+              envError =
+                "build.gradle.kts not found - run forge_init_project first";
+            }
           }
 
           if (!envReady) {
@@ -1457,22 +2121,24 @@ For each feature:
               python: "pytest 2>&1 || python -m pytest 2>&1",
               go: "go test ./... 2>&1",
               rust: "cargo test 2>&1",
+              swift: "swift test 2>&1",
+              kotlin: "test -x ./gradlew && ./gradlew test || gradle test",
             };
             cmd = testCommands[language] || "npm test 2>&1";
           }
 
           let output = "";
           let success = false;
-          try {
-            output = execSync(cmd, {
-              cwd: project.workdir,
-              encoding: "utf8",
-              timeout: 120000,
-            });
-            success = true;
-          } catch (err) {
-            output = err.stdout || err.stderr || err.message;
-          }
+          const testResult = await runCommand(cmd, {
+            cwd: project.workdir,
+            timeoutMs: 120_000,
+          });
+          output =
+            testResult.stdout ||
+            testResult.stderr ||
+            testResult.error?.message ||
+            "";
+          success = testResult.ok;
 
           logger.info?.(
             `[forge] Tests run for ${projectId}: ${success ? "PASS" : "FAIL"}`,
@@ -1518,9 +2184,8 @@ For each feature:
 
         if (!projectId) return { success: false, error: "Missing projectId" };
 
-        try {
-          execSync("gh --version", { stdio: "ignore" });
-        } catch {
+        const ghCheck = await runCommand("gh --version", { timeoutMs: 10_000 });
+        if (!ghCheck.ok) {
           return {
             success: false,
             error: "GitHub CLI (gh) not installed. Run: brew install gh",
@@ -1549,12 +2214,29 @@ For each feature:
           }
 
           if (!fs.existsSync(path.join(workdir, ".git"))) {
-            execSync("git init", { cwd: workdir });
-            execSync("git add -A", { cwd: workdir });
-            execSync(
+            const initRes = await runCommand("git init", { cwd: workdir });
+            if (!initRes.ok)
+              return error(
+                "GIT_ERROR",
+                initRes.stderr || initRes.error?.message || "git init failed",
+              );
+            const addRes = await runCommand("git add -A", { cwd: workdir });
+            if (!addRes.ok)
+              return error(
+                "GIT_ERROR",
+                addRes.stderr || addRes.error?.message || "git add failed",
+              );
+            const commitRes = await runCommand(
               `git commit -m "${escapeShellArg(commitMessage).slice(1, -1)}"`,
               { cwd: workdir },
             );
+            if (!commitRes.ok)
+              return error(
+                "GIT_ERROR",
+                commitRes.stderr ||
+                  commitRes.error?.message ||
+                  "git commit failed",
+              );
           }
 
           const visibilityFlag =
@@ -1562,27 +2244,44 @@ For each feature:
           const safeRepoName = escapeShellArg(repoName);
 
           let githubUrl = "";
-          try {
-            const result = execSync(
-              `gh repo create ${safeRepoName} ${visibilityFlag} --source="${workdir}" --push --description="${escapeShellArg(project.name)}" 2>&1`,
-              { cwd: workdir, encoding: "utf8" },
-            );
+          const createRes = await runCommand(
+            `gh repo create ${safeRepoName} ${visibilityFlag} --source="${workdir}" --push --description="${escapeShellArg(project.name)}" 2>&1`,
+            { cwd: workdir },
+          );
+          if (createRes.ok) {
+            const result = createRes.stdout || createRes.stderr || "";
             const match = result.match(/https:\/\/github\.com\/[^\s]+/);
             githubUrl = match ? match[0] : `https://github.com/${safeRepoName}`;
-          } catch (err) {
-            if (err.message?.includes("already exists")) {
-              const ghUser = execSync(
+          } else {
+            const createError = `${createRes.stdout}\n${createRes.stderr}\n${createRes.error?.message || ""}`;
+            if (createError.includes("already exists")) {
+              const ghUserRes = await runCommand(
                 'gh api user --jq .login 2>/dev/null || echo "unknown"',
-                { encoding: "utf8" },
-              ).trim();
-              execSync(
+                { cwd: workdir },
+              );
+              const ghUser = (ghUserRes.stdout || "unknown").trim();
+              const remoteRes = await runCommand(
                 `git remote add origin https://github.com/${ghUser}/${safeRepoName}.git 2>/dev/null || git remote set-url origin https://github.com/${ghUser}/${safeRepoName}.git`,
                 { cwd: workdir },
               );
-              execSync("git push -u origin HEAD 2>&1", { cwd: workdir });
+              if (!remoteRes.ok)
+                return error(
+                  "GIT_ERROR",
+                  remoteRes.stderr ||
+                    remoteRes.error?.message ||
+                    "git remote failed",
+                );
+              const pushRes = await runCommand("git push -u origin HEAD 2>&1", {
+                cwd: workdir,
+              });
+              if (!pushRes.ok)
+                return error(
+                  "GIT_ERROR",
+                  pushRes.stderr || pushRes.error?.message || "git push failed",
+                );
               githubUrl = `https://github.com/${ghUser}/${repoName}`;
             } else {
-              throw err;
+              return error("GIT_ERROR", createError || "gh repo create failed");
             }
           }
 
@@ -1907,7 +2606,8 @@ ${feature.architecture || "No architecture defined"}
           projectId: { type: "string" },
           language: {
             type: "string",
-            description: "typescript, javascript, python, go, rust",
+            description:
+              "typescript, javascript, python, go, rust, swift, kotlin",
           },
           framework: {
             type: "string",
@@ -2131,6 +2831,52 @@ edition = "2021"
             files[".gitignore"] = `target/
 Cargo.lock
 `;
+          } else if (lang === "swift") {
+            files["Package.swift"] = `// swift-tools-version: 5.9
+import PackageDescription
+
+let package = Package(
+    name: "${projName}",
+    targets: [
+        .executableTarget(
+            name: "${projName}"
+        )
+    ]
+)
+`;
+            files[`Sources/${projName}/main.swift`] = `import Foundation
+
+print("Hello from ${project.name}!")
+`;
+            files[".gitignore"] = `.build/
+.swiftpm/
+`;
+          } else if (lang === "kotlin") {
+            files["settings.gradle.kts"] = `rootProject.name = "${projName}"
+`;
+            files["build.gradle.kts"] = `plugins {
+    kotlin("jvm") version "1.9.25"
+    application
+}
+
+repositories {
+    mavenCentral()
+}
+
+application {
+    mainClass.set("MainKt")
+}
+`;
+            files["src/main/kotlin/Main.kt"] = `fun main() {
+    println("Hello from ${project.name}!")
+}
+`;
+            files[".gitignore"] = `.gradle/
+build/
+out/
+`;
+          } else {
+            return error("INVALID_INPUT", `Unsupported language: ${lang}`);
           }
 
           // 写入文件
@@ -2144,6 +2890,11 @@ Cargo.lock
             fs.writeFileSync(filepath, content);
             createdFiles.push(filename);
           }
+          const indexDiff = await incrementalIndexProject(
+            db,
+            projectId,
+            workdir,
+          );
 
           // 更新项目选项
           options.language = lang;
@@ -2164,6 +2915,10 @@ Cargo.lock
             language: lang,
             framework: framework || "none",
             createdFiles,
+            indexed: {
+              changedFiles: indexDiff.changed.length,
+              removedFiles: indexDiff.removed.length,
+            },
             nextStep: "Run forge_install to install dependencies",
           };
         } finally {
@@ -2258,6 +3013,11 @@ Cargo.lock
                 cmd += ` && cargo add ${pkg}`;
               }
             }
+          } else if (language === "swift") {
+            cmd = "swift package resolve";
+          } else if (language === "kotlin") {
+            cmd =
+              "test -x ./gradlew && ./gradlew dependencies || gradle dependencies";
           } else {
             return {
               success: false,
@@ -2265,17 +3025,20 @@ Cargo.lock
             };
           }
 
-          try {
-            output = execSync(cmd, {
-              cwd: workdir,
-              encoding: "utf8",
-              timeout: 300000,
-            });
-          } catch (err) {
+          const installRes = await runCommand(cmd, {
+            cwd: workdir,
+            timeoutMs: 300_000,
+          });
+          output =
+            installRes.stdout ||
+            installRes.stderr ||
+            installRes.error?.message ||
+            "";
+          if (!installRes.ok) {
             return {
               success: false,
               error: "Installation failed",
-              output: err.stdout || err.stderr || err.message,
+              output,
               workdir,
             };
           }
@@ -2362,9 +3125,31 @@ Cargo.lock
           switch (action) {
             case "init":
               if (!fs.existsSync(path.join(workdir, ".git"))) {
-                execSync("git init", { cwd: workdir });
-                execSync("git add -A", { cwd: workdir });
-                execSync(`git commit -m "Initial commit"`, { cwd: workdir });
+                const initRes = await runCommand("git init", { cwd: workdir });
+                if (!initRes.ok)
+                  return error(
+                    "GIT_ERROR",
+                    initRes.stderr ||
+                      initRes.error?.message ||
+                      "git init failed",
+                  );
+                const addRes = await runCommand("git add -A", { cwd: workdir });
+                if (!addRes.ok)
+                  return error(
+                    "GIT_ERROR",
+                    addRes.stderr || addRes.error?.message || "git add failed",
+                  );
+                const commitRes = await runCommand(
+                  'git commit -m "Initial commit"',
+                  { cwd: workdir },
+                );
+                if (!commitRes.ok)
+                  return error(
+                    "GIT_ERROR",
+                    commitRes.stderr ||
+                      commitRes.error?.message ||
+                      "git commit failed",
+                  );
                 output = "Git repository initialized";
               } else {
                 output = "Git repository already exists";
@@ -2372,43 +3157,80 @@ Cargo.lock
               break;
 
             case "status":
-              output = execSync("git status --short", {
-                cwd: workdir,
-                encoding: "utf8",
-              });
+              {
+                const statusRes = await runCommand("git status --short", {
+                  cwd: workdir,
+                });
+                if (!statusRes.ok)
+                  return error(
+                    "GIT_ERROR",
+                    statusRes.stderr ||
+                      statusRes.error?.message ||
+                      "git status failed",
+                  );
+                output = statusRes.stdout;
+              }
               break;
 
             case "commit":
-              execSync("git add -A", { cwd: workdir });
-              try {
-                output = execSync(
-                  `git diff --cached --quiet && echo "Nothing to commit" || git commit -m "${escapeShellArg(message).slice(1, -1)}"`,
-                  { cwd: workdir, encoding: "utf8" },
-                );
-              } catch (e) {
+              {
+                const addRes = await runCommand("git add -A", { cwd: workdir });
+                if (!addRes.ok)
+                  return error(
+                    "GIT_ERROR",
+                    addRes.stderr || addRes.error?.message || "git add failed",
+                  );
+              }
+              {
+                const commitCmd = `git diff --cached --quiet && echo "Nothing to commit" || git commit -m "${escapeShellArg(message).slice(1, -1)}"`;
+                const commitRes = await runCommand(commitCmd, { cwd: workdir });
                 output =
-                  e.stdout ||
-                  e.stderr ||
+                  commitRes.stdout ||
+                  commitRes.stderr ||
                   "Commit skipped (no changes or hook rejected)";
               }
               break;
 
             case "pull":
-              output = execSync("git pull", { cwd: workdir, encoding: "utf8" });
+              {
+                const pullRes = await runCommand("git pull", { cwd: workdir });
+                if (!pullRes.ok)
+                  return error(
+                    "GIT_ERROR",
+                    pullRes.stderr ||
+                      pullRes.error?.message ||
+                      "git pull failed",
+                  );
+                output = pullRes.stdout;
+              }
               break;
 
             case "branch":
               if (branch) {
-                execSync(
+                const branchRes = await runCommand(
                   `git checkout -b "${escapeShellArg(branch).slice(1, -1)}"`,
                   { cwd: workdir },
                 );
+                if (!branchRes.ok)
+                  return error(
+                    "GIT_ERROR",
+                    branchRes.stderr ||
+                      branchRes.error?.message ||
+                      "git checkout failed",
+                  );
                 output = `Created and switched to branch: ${branch}`;
               } else {
-                output = execSync("git branch -a", {
+                const listRes = await runCommand("git branch -a", {
                   cwd: workdir,
-                  encoding: "utf8",
                 });
+                if (!listRes.ok)
+                  return error(
+                    "GIT_ERROR",
+                    listRes.stderr ||
+                      listRes.error?.message ||
+                      "git branch failed",
+                  );
+                output = listRes.stdout;
               }
               break;
 
@@ -2418,17 +3240,34 @@ Cargo.lock
                   success: false,
                   error: "Branch name required for merge",
                 };
-              output = execSync(
-                `git merge "${escapeShellArg(branch).slice(1, -1)}"`,
-                { cwd: workdir, encoding: "utf8" },
-              );
+              {
+                const mergeRes = await runCommand(
+                  `git merge "${escapeShellArg(branch).slice(1, -1)}"`,
+                  { cwd: workdir },
+                );
+                if (!mergeRes.ok)
+                  return error(
+                    "GIT_ERROR",
+                    mergeRes.stderr ||
+                      mergeRes.error?.message ||
+                      "git merge failed",
+                  );
+                output = mergeRes.stdout;
+              }
               break;
 
             case "log":
-              output = execSync("git log --oneline -10", {
-                cwd: workdir,
-                encoding: "utf8",
-              });
+              {
+                const logRes = await runCommand("git log --oneline -10", {
+                  cwd: workdir,
+                });
+                if (!logRes.ok)
+                  return error(
+                    "GIT_ERROR",
+                    logRes.stderr || logRes.error?.message || "git log failed",
+                  );
+                output = logRes.stdout;
+              }
               break;
 
             default:
@@ -2732,7 +3571,60 @@ Cargo.lock
     ),
   );
 
+  // ==================== 工具 21: forge_index ====================
+  api.registerTool(
+    tool(
+      "forge_index",
+      "Run incremental index and return changed files",
+      {
+        type: "object",
+        properties: {
+          projectId: { type: "string" },
+        },
+        required: ["projectId"],
+      },
+      async (params) => {
+        const projectId = params?.projectId;
+        if (!projectId) return error("MISSING_PARAM", "Missing projectId");
+
+        const db = await initDB();
+        try {
+          const project = await get(db, "SELECT * FROM projects WHERE id=?", [
+            projectId,
+          ]);
+          if (!project)
+            return error("NOT_FOUND", "Project not found", { projectId });
+          const diff = await incrementalIndexProject(
+            db,
+            projectId,
+            project.workdir,
+          );
+          return {
+            success: true,
+            projectId,
+            workdir: project.workdir,
+            changedFiles: diff.changed,
+            removedFiles: diff.removed,
+            changedCount: diff.changed.length,
+            removedCount: diff.removed.length,
+          };
+        } finally {
+          closeDB(db);
+        }
+      },
+    ),
+  );
+
   logger.info?.(
-    "[forge] Extension loaded v2.5.0 - Full PRD → Code Automation (Enhanced Errors)",
+    "[forge] Extension loaded v2.6.0 - Full PRD → Code Automation (Async + Pool + Cache + Security)",
   );
 }
+
+export const __testing = {
+  runCommand,
+  LRUCache,
+  RateLimiter,
+  validateToolParams,
+  normalizeErrorResult,
+  computeIncrementalChanges,
+};

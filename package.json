@@ -1,10 +1,17 @@
 {
   "name": "forge",
-  "version": "2.0.0",
+  "version": "2.6.0",
   "description": "PRD → Production Code Automation - 完整的代码自动化系统",
   "type": "module",
   "main": "index.js",
+  "scripts": {
+    "test": "node --experimental-vm-modules ./node_modules/jest/bin/jest.js"
+  },
   "dependencies": {
-    "sqlite3": "^5.1.6"
+    "sqlite3": "^5.1.6",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0"
   }
 }
