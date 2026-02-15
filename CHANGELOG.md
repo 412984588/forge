@@ -1,5 +1,30 @@
 # Changelog
 
+## 2.6.4 - 2026-02-15
+
+### Fixed
+
+- Added legacy schema auto-migration for missing `features.assigned_model`, `features.implementation`, `features.review_notes`, and `projects.options`.
+- Added push-blocker remediation workflow: auto-detect remote, configure `origin`, and push retry loop.
+
+### Performance
+
+- Optimized `forge_run` hot path with single-query project context fetch and short-lived context caching.
+- Optimized `forge_implement` with idempotent in-progress run reuse (avoid duplicate spawn/insert for same running feature).
+- Reduced repeated synchronous filesystem checks in `forge_implement` via cached workdir existence probe.
+- Reduced JSON parse churn using cached project-options decoding and dependency normalization.
+
+### Security
+
+- Kept audit logging enabled by default and disabled audit I/O in `NODE_ENV=test` / Jest to avoid benchmark contamination.
+- Kept whitelist/rate-limit/error-shape behavior backward-compatible.
+
+### Tests
+
+- Added regression tests for:
+  - repeated `forge_run` stability on same project
+  - repeated `forge_implement` run reuse semantics
+
 ## 2.6.3 - 2026-02-15
 
 ### Fixed

@@ -6,6 +6,10 @@ import sqlite3pkg from "sqlite3";
 import register, { __testing } from "../index.js";
 
 describe("forge internals", () => {
+  beforeEach(() => {
+    __testing.resetRuntimeStateForTests();
+  });
+
   test("runCommand executes asynchronously and returns stdout", async () => {
     const result = await __testing.runCommand('node -e "console.log(123)"', {
       timeoutMs: 3000,
@@ -251,6 +255,108 @@ describe("forge internals", () => {
       expect(secondStatus.success).toBe(true);
       expect(firstStatus.progress.total).toBe(1);
       expect(secondStatus.progress.total).toBe(2);
+    } finally {
+      process.env.HOME = originalHome;
+      process.env.OPENCLAW_STATE_DIR = originalStateDir;
+      await fs.promises.rm(tempHome, { recursive: true, force: true });
+    }
+  });
+
+  test("forge_run remains stable across repeated calls on same project", async () => {
+    const tools = new Map();
+    const originalHome = process.env.HOME;
+    const originalStateDir = process.env.OPENCLAW_STATE_DIR;
+    const tempHome = await fs.promises.mkdtemp(
+      path.join(os.tmpdir(), "forge-run-repeat-"),
+    );
+    process.env.HOME = tempHome;
+    process.env.OPENCLAW_STATE_DIR = path.join(tempHome, ".forge-state");
+
+    try {
+      register({
+        logger: { info: () => {}, warn: () => {}, error: () => {} },
+        registerTool: (toolDef) => tools.set(toolDef.name, toolDef),
+      });
+
+      const prd = [
+        "# Run Repeat Project",
+        "### Feature 1: Auth",
+        "- 描述: login",
+        "- 优先级: P1",
+        "### Feature 2: Profile",
+        "- 描述: profile",
+        "- 优先级: P1",
+      ].join("\n");
+
+      const init = await tools.get("forge_init").execute("t", { prd });
+      expect(init.success).toBe(true);
+
+      const first = await tools.get("forge_run").execute("t", {
+        projectId: init.projectId,
+        steps: ["plan", "implement"],
+      });
+      const second = await tools.get("forge_run").execute("t", {
+        projectId: init.projectId,
+        steps: ["plan", "implement"],
+      });
+
+      expect(first.success).toBe(true);
+      expect(second.success).toBe(true);
+      expect(first.features).toBe(2);
+      expect(second.features).toBe(2);
+      expect(first.workflow).toEqual(second.workflow);
+    } finally {
+      process.env.HOME = originalHome;
+      process.env.OPENCLAW_STATE_DIR = originalStateDir;
+      await fs.promises.rm(tempHome, { recursive: true, force: true });
+    }
+  });
+
+  test("forge_implement reuses running execution on repeated calls", async () => {
+    const tools = new Map();
+    const originalHome = process.env.HOME;
+    const originalStateDir = process.env.OPENCLAW_STATE_DIR;
+    const tempHome = await fs.promises.mkdtemp(
+      path.join(os.tmpdir(), "forge-impl-repeat-"),
+    );
+    process.env.HOME = tempHome;
+    process.env.OPENCLAW_STATE_DIR = path.join(tempHome, ".forge-state");
+
+    try {
+      register({
+        logger: { info: () => {}, warn: () => {}, error: () => {} },
+        registerTool: (toolDef) => tools.set(toolDef.name, toolDef),
+      });
+
+      const prd = [
+        "# Implement Repeat Project",
+        "### Feature 1: Core",
+        "- 描述: core feature",
+        "- 优先级: P1",
+      ].join("\n");
+
+      const init = await tools.get("forge_init").execute("t", { prd });
+      expect(init.success).toBe(true);
+
+      const next = await tools
+        .get("forge_next")
+        .execute("t", { projectId: init.projectId, count: 1 });
+      expect(next.success).toBe(true);
+      const featureId = next.readyFeatures?.[0]?.id;
+      expect(featureId).toBeDefined();
+
+      const first = await tools
+        .get("forge_implement")
+        .execute("t", { featureId });
+      const second = await tools
+        .get("forge_implement")
+        .execute("t", { featureId });
+
+      expect(first.success).toBe(true);
+      expect(second.success).toBe(true);
+      expect(first.task).toBe(second.task);
+      expect(second.runId).toBe(first.runId);
+      expect(second.reusedRun).toBe(true);
     } finally {
       process.env.HOME = originalHome;
       process.env.OPENCLAW_STATE_DIR = originalStateDir;
