@@ -23,6 +23,21 @@ const PROJECTS_DIR = path.join(process.env.HOME || "/tmp", "forge-projects");
 const DEFAULT_MODEL =
   process.env.FORGE_MODEL || "anthropic-newcli/claude-opus-4-6-20250528";
 
+// P2: 安全的 JSON 解析
+function safeJSONParse(str, fallback = null) {
+  try {
+    return JSON.parse(str);
+  } catch (err) {
+    console.warn(
+      "[forge] JSON parse error:",
+      err.message,
+      "Input:",
+      str?.substring(0, 100),
+    );
+    return fallback;
+  }
+}
+
 // 确保 DB 目录存在
 const DB_DIR = path.dirname(DB_PATH);
 if (!fs.existsSync(DB_DIR)) {
@@ -76,8 +91,7 @@ function initDB() {
           error TEXT,
           output TEXT
         )`);
-        db.run(
-          `CREATE TABLE IF NOT EXISTS commits (
+        db.run(`CREATE TABLE IF NOT EXISTS commits (
           id TEXT PRIMARY KEY,
           project_id TEXT,
           feature_id TEXT,
@@ -85,7 +99,19 @@ function initDB() {
           message TEXT,
           author TEXT,
           created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )`,
+        )`);
+        // P3: 性能优化 - 添加索引
+        db.run(
+          `CREATE INDEX IF NOT EXISTS idx_features_project ON features(project_id)`,
+        );
+        db.run(
+          `CREATE INDEX IF NOT EXISTS idx_features_status ON features(status)`,
+        );
+        db.run(
+          `CREATE INDEX IF NOT EXISTS idx_runs_project ON runs(project_id)`,
+        );
+        db.run(
+          `CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status)`,
           [],
           () => resolve(db),
         );
@@ -132,7 +158,7 @@ function detectCycle(features) {
   const recStack = new Set();
 
   features.forEach((f) => {
-    graph[f.id] = JSON.parse(f.dependencies || "[]");
+    graph[f.id] = safeJSONParse(f.dependencies, []);
   });
 
   function dfs(node) {
@@ -166,7 +192,7 @@ function validateDependencies(features) {
   const errors = [];
 
   features.forEach((f) => {
-    const deps = JSON.parse(f.dependencies || "[]");
+    const deps = safeJSONParse(f.dependencies, []);
     deps.forEach((dep) => {
       if (!ids.has(dep)) {
         errors.push(`Feature "${f.id}" 依赖不存在的 "${dep}"`);
@@ -556,7 +582,7 @@ export default function register(api) {
             "SELECT id, name, description, dependencies FROM features WHERE project_id=?",
             [projectId],
           );
-          const options = JSON.parse(project.options || "{}");
+          const options = safeJSONParse(project.options, {});
 
           const archPrompt = `# Architecture Design Task
 
@@ -745,7 +771,7 @@ After designing, save the result by calling forge_save_architecture with the arc
 
           const ready = features
             .filter((f) => {
-              const deps = JSON.parse(f.dependencies || "[]");
+              const deps = safeJSONParse(f.dependencies, []);
               return deps.every(
                 (d) => completeIds.has(d) || !pendingIds.has(d),
               );
@@ -837,7 +863,7 @@ After designing, save the result by calling forge_save_architecture with the arc
             "SELECT f.*, p.name as project_name, p.workdir, p.architecture, p.options FROM features f JOIN projects p ON f.project_id = p.id WHERE f.id=?",
             [featureId],
           );
-          const options = JSON.parse(existing.options || "{}");
+          const options = safeJSONParse(existing.options, {});
 
           const implPrompt = `# Implementation Task
 
@@ -950,7 +976,7 @@ Provide the complete implementation including:
           }
           // in_progress 状态继续执行
 
-          const options = JSON.parse(feature.options || "{}");
+          const options = safeJSONParse(feature.options, {});
           const useModel =
             model ||
             options.coderModel ||
@@ -962,7 +988,7 @@ Provide the complete implementation including:
 ## Feature: ${feature.name}
 
 **Description**: ${feature.description}
-**Dependencies**: ${JSON.parse(feature.dependencies || "[]").join(", ") || "None"}
+**Dependencies**: ${safeJSONParse(feature.dependencies, []).join(", ") || "None"}
 
 ## Work Directory
 ${feature.workdir}
@@ -1267,7 +1293,7 @@ After implementation:
             );
           }
 
-          const options = JSON.parse(project.options || "{}");
+          const options = safeJSONParse(project.options, {});
           const reviewModel =
             model ||
             options.reviewerModel ||
@@ -1380,7 +1406,7 @@ For each feature:
             };
           }
 
-          const options = JSON.parse(project.options || "{}");
+          const options = safeJSONParse(project.options, {});
           const language = options.language || "typescript";
 
           // P4: 环境检测
@@ -1611,7 +1637,7 @@ For each feature:
             "SELECT id, name, status FROM features WHERE project_id=?",
             [projectId],
           );
-          const options = JSON.parse(project.options || "{}");
+          const options = safeJSONParse(project.options, {});
 
           const workflow = [];
           if (steps.includes("plan")) {
@@ -1722,7 +1748,7 @@ For each feature:
             ["retrying", featureId, "running"],
           );
 
-          const options = JSON.parse(feature.options || "{}");
+          const options = safeJSONParse(feature.options, {});
           const useModel =
             model ||
             options.coderModel ||
@@ -1905,7 +1931,7 @@ ${feature.architecture || "No architecture defined"}
             fs.mkdirSync(workdir, { recursive: true });
           }
 
-          const options = JSON.parse(project.options || "{}");
+          const options = safeJSONParse(project.options, {});
           const lang = language || options.language || "typescript";
           const projName =
             name || project.name.toLowerCase().replace(/[^a-z0-9-]/g, "-");
@@ -2179,7 +2205,7 @@ Cargo.lock
             };
           }
 
-          const options = JSON.parse(project.options || "{}");
+          const options = safeJSONParse(project.options, {});
           const language = options.language || "typescript";
 
           let cmd = "";
@@ -2458,7 +2484,7 @@ Cargo.lock
             "SELECT id, name, description, priority, dependencies FROM features WHERE project_id=?",
             [projectId],
           );
-          const options = JSON.parse(project.options || "{}");
+          const options = safeJSONParse(project.options, {});
 
           // 模板目录
           const templateDir = path.join(
@@ -2484,7 +2510,7 @@ Cargo.lock
               name: f.name,
               description: f.description,
               priority: f.priority,
-              dependencies: JSON.parse(f.dependencies || "[]"),
+              dependencies: safeJSONParse(f.dependencies, []),
             })),
             createdAt: new Date().toISOString(),
           };
