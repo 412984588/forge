@@ -1,5 +1,8 @@
 import { jest } from "@jest/globals";
-import { __testing } from "../index.js";
+import fs from "fs";
+import os from "os";
+import path from "path";
+import register, { __testing } from "../index.js";
 
 describe("forge internals", () => {
   test("runCommand executes asynchronously and returns stdout", async () => {
@@ -62,5 +65,71 @@ describe("forge internals", () => {
     );
     expect(result.changed).toEqual(["src/b.ts"]);
     expect(result.removed).toEqual([]);
+  });
+
+  test("forge_init succeeds for PRD with dependencies (no crash on array parse)", async () => {
+    const tools = new Map();
+    register({
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      registerTool: (toolDef) => tools.set(toolDef.name, toolDef),
+    });
+
+    const prd = [
+      "# Demo",
+      "### Feature 1: Auth",
+      "- 描述: login",
+      "- 优先级: P1",
+      "- 依赖: 无",
+      "### Feature 2: Profile",
+      "- 描述: profile page",
+      "- 优先级: P1",
+      "- 依赖: feat-001",
+    ].join("\n");
+
+    const result = await tools.get("forge_init").execute("t", { prd });
+    expect(result.success).toBe(true);
+    expect(result.projectId).toBeDefined();
+  });
+
+  test("forge_init can create two projects from same PRD without feature ID collision", async () => {
+    const tools = new Map();
+    register({
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      registerTool: (toolDef) => tools.set(toolDef.name, toolDef),
+    });
+    const prd = [
+      "# Collision Check",
+      "### Feature 1: A",
+      "- 描述: a",
+      "- 优先级: P1",
+      "- 依赖: 无",
+      "### Feature 2: B",
+      "- 描述: b",
+      "- 优先级: P1",
+      "- 依赖: feat-001",
+    ].join("\n");
+
+    const first = await tools.get("forge_init").execute("t1", { prd });
+    const second = await tools.get("forge_init").execute("t2", { prd });
+    expect(first.success).toBe(true);
+    expect(second.success).toBe(true);
+  });
+
+  test("input whitelist rejects unsafe package names", () => {
+    const validation = __testing.validateToolParams("forge_install", {
+      projectId: "proj-1",
+      packages: ["lodash", "evil;rm -rf /"],
+      dev: false,
+    });
+    expect(validation.valid).toBe(false);
+  });
+
+  test("state machine blocks invalid transition pending -> complete", () => {
+    expect(__testing.isValidFeatureTransition("pending", "complete")).toBe(
+      false,
+    );
+    expect(__testing.isValidFeatureTransition("pending", "in_progress")).toBe(
+      true,
+    );
   });
 });

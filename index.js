@@ -49,15 +49,14 @@ const WS_PORT = Math.max(1024, Number(process.env.FORGE_WS_PORT || 17345));
  * @returns {any}
  */
 function safeJSONParse(str, fallback = null) {
+  if (str == null) return fallback;
+  if (typeof str !== "string") return str;
   try {
     return JSON.parse(str);
   } catch (err) {
-    console.warn(
-      "[forge] JSON parse error:",
-      err.message,
-      "Input:",
-      str?.substring(0, 100),
-    );
+    const preview =
+      typeof str === "string" ? str.slice(0, 100) : String(str).slice(0, 100);
+    console.warn("[forge] JSON parse error:", err.message, "Input:", preview);
     return fallback;
   }
 }
@@ -85,7 +84,7 @@ let wsState = { started: false, server: null, clients: new Set(), url: null };
  * @returns {Promise<void>}
  */
 function ensureSchema(db) {
-  const schemaSQL = [
+  const tableSQL = [
     `CREATE TABLE IF NOT EXISTS projects (
       id TEXT PRIMARY KEY,
       name TEXT,
@@ -146,21 +145,26 @@ function ensureSchema(db) {
       payload TEXT,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`,
+  ];
+  const indexSQL = [
     `CREATE INDEX IF NOT EXISTS idx_features_project ON features(project_id)`,
     `CREATE INDEX IF NOT EXISTS idx_features_status ON features(status)`,
+    `CREATE INDEX IF NOT EXISTS idx_features_project_status_priority_created ON features(project_id, status, priority, created_at)`,
     `CREATE INDEX IF NOT EXISTS idx_runs_project ON runs(project_id)`,
     `CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status)`,
+    `CREATE INDEX IF NOT EXISTS idx_runs_project_started_at ON runs(project_id, started_at DESC)`,
   ];
-  return new Promise((resolve, reject) => {
-    db.serialize(() => {
+
+  const runSequential = (sqlList, { ignoreError = false } = {}) =>
+    new Promise((resolve, reject) => {
       let i = 0;
       const next = () => {
-        if (i >= schemaSQL.length) {
+        if (i >= sqlList.length) {
           resolve();
           return;
         }
-        db.run(schemaSQL[i], [], (err) => {
-          if (err) {
+        db.run(sqlList[i], [], (err) => {
+          if (err && !ignoreError) {
             reject(err);
             return;
           }
@@ -169,6 +173,48 @@ function ensureSchema(db) {
         });
       };
       next();
+    });
+
+  const ensureColumn = (tableName, columnName, definition) =>
+    new Promise((resolve, reject) => {
+      db.all(`PRAGMA table_info(${tableName})`, [], (err, rows) => {
+        if (err) {
+          reject(err);
+          return;
+        }
+        const exists = (rows || []).some((row) => row.name === columnName);
+        if (exists) {
+          resolve();
+          return;
+        }
+        db.run(
+          `ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`,
+          [],
+          (alterErr) => {
+            if (alterErr) {
+              reject(alterErr);
+              return;
+            }
+            resolve();
+          },
+        );
+      });
+    });
+
+  return new Promise((resolve, reject) => {
+    db.serialize(() => {
+      runSequential(tableSQL)
+        .then(() =>
+          ensureColumn(
+            "runs",
+            "started_at",
+            "DATETIME DEFAULT CURRENT_TIMESTAMP",
+          ),
+        )
+        .then(() => ensureColumn("runs", "completed_at", "DATETIME"))
+        .then(() => runSequential(indexSQL, { ignoreError: true }))
+        .then(() => resolve())
+        .catch((err) => reject(err));
     });
   });
 }
@@ -235,17 +281,6 @@ function closeDB(db) {
   dbPool.inUse = Math.max(0, dbPool.inUse - 1);
   dbPool.available.push(db);
 }
-
-function shutdownDBPool() {
-  for (const db of dbPool.available) {
-    try {
-      db.close();
-    } catch {}
-  }
-  dbPool.available = [];
-}
-
-process.once("exit", shutdownDBPool);
 
 /**
  * 执行写操作 SQL。
@@ -505,6 +540,18 @@ function escapeShellArg(str) {
   return "'" + String(str).replace(/'/g, "'\\''") + "'";
 }
 
+function toScopedFeatureId(projectId, featureId) {
+  return `${projectId}::${featureId}`;
+}
+
+function fromScopedFeatureId(featureId) {
+  if (typeof featureId !== "string") return featureId;
+  const marker = "::";
+  const pos = featureId.lastIndexOf(marker);
+  if (pos === -1) return featureId;
+  return featureId.slice(pos + marker.length);
+}
+
 const ERROR_CODES = {
   MISSING_PARAM: {
     code: "E001",
@@ -641,6 +688,9 @@ const rateLimiter = new RateLimiter({
 
 const ID_PATTERN = /^[a-zA-Z0-9._:-]{1,128}$/;
 const NAME_PATTERN = /^[a-zA-Z0-9._@/: -]{1,200}$/;
+const REPO_PATTERN = /^[a-zA-Z0-9._-]{1,120}$/;
+const PACKAGE_PATTERN = /^[a-zA-Z0-9._@/:-]{1,120}$/;
+const COMMAND_UNSAFE_PATTERN = /[;&|`$<>\\\n\r]/;
 const SAFE_TEXT_PATTERN = /^[\s\S]{0,200000}$/;
 const ALLOWED_LANGUAGES = new Set([
   "typescript",
@@ -660,6 +710,18 @@ const ALLOWED_GIT_ACTIONS = new Set([
   "merge",
   "log",
 ]);
+const FEATURE_STATUS_TRANSITIONS = {
+  pending: new Set(["in_progress", "cancelled"]),
+  in_progress: new Set(["complete", "cancelled", "pending"]),
+  cancelled: new Set(["pending"]),
+  complete: new Set(["complete"]),
+};
+
+function isValidFeatureTransition(fromStatus, toStatus) {
+  const allowed = FEATURE_STATUS_TRANSITIONS[fromStatus];
+  if (!allowed) return false;
+  return allowed.has(toStatus);
+}
 
 /**
  * 推断错误类型。
@@ -758,8 +820,11 @@ function validateToolParams(toolName, params) {
     const errMsg = check(params[field], ID_PATTERN, field);
     if (errMsg) return { valid: false, error: errMsg };
   }
+  if (params.repoName != null) {
+    const repoErr = check(params.repoName, REPO_PATTERN, "repoName");
+    if (repoErr) return { valid: false, error: repoErr };
+  }
   const commonFields = [
-    "repoName",
     "branch",
     "action",
     "language",
@@ -771,6 +836,32 @@ function validateToolParams(toolName, params) {
     if (params[field] == null) continue;
     const errMsg = check(params[field], NAME_PATTERN, field);
     if (errMsg) return { valid: false, error: errMsg };
+  }
+  if (params.testCommand != null) {
+    if (
+      typeof params.testCommand !== "string" ||
+      params.testCommand.length > 200
+    ) {
+      return { valid: false, error: "Invalid testCommand format" };
+    }
+    if (COMMAND_UNSAFE_PATTERN.test(params.testCommand)) {
+      return { valid: false, error: "Unsafe characters in testCommand" };
+    }
+  }
+  if (params.commitMessage != null) {
+    if (
+      typeof params.commitMessage !== "string" ||
+      params.commitMessage.length > 200
+    ) {
+      return { valid: false, error: "Invalid commitMessage format" };
+    }
+  }
+  if (Array.isArray(params.packages)) {
+    for (const pkg of params.packages) {
+      if (typeof pkg !== "string" || !PACKAGE_PATTERN.test(pkg)) {
+        return { valid: false, error: "Invalid package name format" };
+      }
+    }
   }
   if (typeof params.prd === "string" && !SAFE_TEXT_PATTERN.test(params.prd)) {
     return { valid: false, error: "Invalid prd content length" };
@@ -821,9 +912,17 @@ async function writeAuditLog(payload) {
 }
 
 function ensureWebSocketServer(logger = console) {
+  const wsDisabled =
+    process.env.FORGE_DISABLE_WS === "1" ||
+    process.env.NODE_ENV === "test" ||
+    !!process.env.JEST_WORKER_ID;
+  if (wsDisabled) return null;
   if (wsState.started) return wsState.url;
   try {
     const server = new WebSocketServer({ port: WS_PORT });
+    server.on("error", (err) => {
+      logger.warn?.(`[forge] WebSocket runtime error: ${err.message}`);
+    });
     wsState.started = true;
     wsState.server = server;
     wsState.url = `ws://127.0.0.1:${WS_PORT}`;
@@ -1133,19 +1232,29 @@ export default function register(api) {
                 JSON.stringify(defaultOptions),
               ],
             );
+            const scopedIdMap = new Map(
+              parsed.features.map((f) => [
+                f.id,
+                toScopedFeatureId(projectId, f.id),
+              ]),
+            );
 
             for (const f of parsed.features) {
+              const scopedDeps = (f.dependencies || []).map(
+                (dep) =>
+                  scopedIdMap.get(dep) || toScopedFeatureId(projectId, dep),
+              );
               await run(
                 db,
                 `INSERT INTO features (id, project_id, name, description, priority, status, dependencies) VALUES (?,?,?,?,?,?,?)`,
                 [
-                  f.id,
+                  scopedIdMap.get(f.id),
                   projectId,
                   f.name,
                   f.description,
                   f.priority,
                   "pending",
-                  JSON.stringify(f.dependencies),
+                  JSON.stringify(scopedDeps),
                 ],
               );
             }
@@ -1751,6 +1860,17 @@ After implementation:
           );
           if (!existing)
             return { success: false, error: "Feature not found", featureId };
+          if (!isValidFeatureTransition(existing.status, "complete")) {
+            return error(
+              "INVALID_STATE",
+              `Illegal status transition ${existing.status} -> complete`,
+              {
+                featureId,
+                fromStatus: existing.status,
+                toStatus: "complete",
+              },
+            );
+          }
 
           const wasComplete = existing.status === "complete";
           await run(
@@ -2212,6 +2332,15 @@ For each feature:
           if (!repoName) {
             repoName = project.name.toLowerCase().replace(/[^a-z0-9-]/g, "-");
           }
+          const normalizedRepoName = String(repoName)
+            .toLowerCase()
+            .replace(/[^a-z0-9._-]/g, "-");
+          if (!normalizedRepoName) {
+            return error(
+              "INVALID_INPUT",
+              "Invalid repoName after normalization",
+            );
+          }
 
           if (!fs.existsSync(path.join(workdir, ".git"))) {
             const initRes = await runCommand("git init", { cwd: workdir });
@@ -2241,7 +2370,7 @@ For each feature:
 
           const visibilityFlag =
             visibility === "public" ? "--public" : "--private";
-          const safeRepoName = escapeShellArg(repoName);
+          const safeRepoName = escapeShellArg(normalizedRepoName);
 
           let githubUrl = "";
           const createRes = await runCommand(
@@ -2251,7 +2380,9 @@ For each feature:
           if (createRes.ok) {
             const result = createRes.stdout || createRes.stderr || "";
             const match = result.match(/https:\/\/github\.com\/[^\s]+/);
-            githubUrl = match ? match[0] : `https://github.com/${safeRepoName}`;
+            githubUrl = match
+              ? match[0]
+              : `https://github.com/${normalizedRepoName}`;
           } else {
             const createError = `${createRes.stdout}\n${createRes.stderr}\n${createRes.error?.message || ""}`;
             if (createError.includes("already exists")) {
@@ -2279,7 +2410,7 @@ For each feature:
                   "GIT_ERROR",
                   pushRes.stderr || pushRes.error?.message || "git push failed",
                 );
-              githubUrl = `https://github.com/${ghUser}/${repoName}`;
+              githubUrl = `https://github.com/${ghUser}/${normalizedRepoName}`;
             } else {
               return error("GIT_ERROR", createError || "gh repo create failed");
             }
@@ -2297,7 +2428,7 @@ For each feature:
             success: true,
             projectId,
             githubUrl,
-            repoName,
+            repoName: normalizedRepoName,
             visibility,
             workdir,
           };
@@ -2341,12 +2472,13 @@ For each feature:
           if (!project)
             return { success: false, error: "Project not found", projectId };
 
-          const features = await all(
+          const featureCountRow = await get(
             db,
-            "SELECT id, name, status FROM features WHERE project_id=?",
+            "SELECT COUNT(1) as count FROM features WHERE project_id=?",
             [projectId],
           );
           const options = safeJSONParse(project.options, {});
+          const featureCount = featureCountRow?.count || 0;
 
           const workflow = [];
           if (steps.includes("plan")) {
@@ -2362,7 +2494,7 @@ For each feature:
             workflow.push({
               step: "implement",
               tool: "forge_next + forge_implement",
-              description: `Implement ${features.length} features`,
+              description: `Implement ${featureCount} features`,
               model: options.coderModel,
               parallel: options.maxParallel,
               autoSpawn: true,
@@ -2397,7 +2529,7 @@ For each feature:
             projectId,
             projectName: project.name,
             status: project.status,
-            features: features.length,
+            features: featureCount,
             workflow,
             instruction:
               "Each step with autoSpawn=true will automatically spawn the required agent. Execute steps in order.",
@@ -2442,6 +2574,17 @@ For each feature:
 
           if (!feature)
             return { success: false, error: "Feature not found", featureId };
+          if (!isValidFeatureTransition(feature.status, "pending")) {
+            return error(
+              "INVALID_STATE",
+              `Illegal status transition ${feature.status} -> pending`,
+              {
+                featureId,
+                fromStatus: feature.status,
+                toStatus: "pending",
+              },
+            );
+          }
 
           // 重置状态为 pending，然后重新实现
           await run(
@@ -3359,7 +3502,9 @@ out/
               name: f.name,
               description: f.description,
               priority: f.priority,
-              dependencies: safeJSONParse(f.dependencies, []),
+              dependencies: safeJSONParse(f.dependencies, []).map((dep) =>
+                fromScopedFeatureId(dep),
+              ),
             })),
             createdAt: new Date().toISOString(),
           };
@@ -3533,18 +3678,28 @@ out/
           );
 
           const parsed = parsePRD(prdContent);
+          const scopedIdMap = new Map(
+            parsed.features.map((f) => [
+              f.id,
+              toScopedFeatureId(projectId, f.id),
+            ]),
+          );
           for (const f of parsed.features) {
+            const scopedDeps = (f.dependencies || []).map(
+              (dep) =>
+                scopedIdMap.get(dep) || toScopedFeatureId(projectId, dep),
+            );
             await run(
               db,
               `INSERT INTO features (id, project_id, name, description, priority, status, dependencies) VALUES (?,?,?,?,?,?,?)`,
               [
-                f.id,
+                scopedIdMap.get(f.id),
                 projectId,
                 f.name,
                 f.description,
                 f.priority,
                 "pending",
-                JSON.stringify(f.dependencies),
+                JSON.stringify(scopedDeps),
               ],
             );
           }
@@ -3616,7 +3771,7 @@ out/
   );
 
   logger.info?.(
-    "[forge] Extension loaded v2.6.0 - Full PRD → Code Automation (Async + Pool + Cache + Security)",
+    "[forge] Extension loaded v2.6.1 - Weekly maintenance (stability + security + perf)",
   );
 }
 
@@ -3627,4 +3782,5 @@ export const __testing = {
   validateToolParams,
   normalizeErrorResult,
   computeIncrementalChanges,
+  isValidFeatureTransition,
 };
