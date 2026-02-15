@@ -215,7 +215,13 @@ function parsePRD(prdContent) {
     return { name: "Empty Project", overview: "", features: [], techStack: [] };
   }
 
-  const lines = prdContent.split("\n");
+  // P2: 输入清理 - 限制长度和危险字符
+  const sanitized = prdContent
+    .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, "") // 移除 script 标签
+    .replace(/javascript:/gi, "") // 移除 javascript: 协议
+    .substring(0, 100000); // 限制 100KB
+
+  const lines = sanitized.split("\n");
   const project = {
     name: "Untitled Project",
     overview: "",
@@ -481,46 +487,50 @@ export default function register(api) {
           fs.writeFileSync(path.join(workdir, "PRD.md"), prdContent);
 
           const defaultOptions = {
-            architectModel:
-              options.architectModel ||
-              "anthropic-newcli/claude-opus-4-6-20250528",
-            coderModel:
-              options.coderModel || "anthropic-newcli/claude-opus-4-6-20250528",
-            reviewerModel:
-              options.reviewerModel ||
-              "anthropic-newcli/claude-opus-4-6-20250528",
+            architectModel: options.architectModel || DEFAULT_MODEL,
+            coderModel: options.coderModel || DEFAULT_MODEL,
+            reviewerModel: options.reviewerModel || DEFAULT_MODEL,
             maxParallel: options.maxParallel || 3,
             language: options.language || "typescript",
             framework: options.framework || "auto",
           };
 
-          await run(
-            db,
-            `INSERT INTO projects (id, name, prd, status, workdir, options) VALUES (?,?,?,?,?,?)`,
-            [
-              projectId,
-              parsed.name,
-              prdContent,
-              "initialized",
-              workdir,
-              JSON.stringify(defaultOptions),
-            ],
-          );
-
-          for (const f of parsed.features) {
+          // P2: 事务支持 - 确保原子性
+          await run(db, "BEGIN TRANSACTION");
+          try {
             await run(
               db,
-              `INSERT INTO features (id, project_id, name, description, priority, status, dependencies) VALUES (?,?,?,?,?,?,?)`,
+              `INSERT INTO projects (id, name, prd, status, workdir, options) VALUES (?,?,?,?,?,?)`,
               [
-                f.id,
                 projectId,
-                f.name,
-                f.description,
-                f.priority,
-                "pending",
-                JSON.stringify(f.dependencies),
+                parsed.name,
+                prdContent,
+                "initialized",
+                workdir,
+                JSON.stringify(defaultOptions),
               ],
             );
+
+            for (const f of parsed.features) {
+              await run(
+                db,
+                `INSERT INTO features (id, project_id, name, description, priority, status, dependencies) VALUES (?,?,?,?,?,?,?)`,
+                [
+                  f.id,
+                  projectId,
+                  f.name,
+                  f.description,
+                  f.priority,
+                  "pending",
+                  JSON.stringify(f.dependencies),
+                ],
+              );
+            }
+
+            await run(db, "COMMIT");
+          } catch (err) {
+            await run(db, "ROLLBACK");
+            throw err;
           }
 
           logger.info?.(
