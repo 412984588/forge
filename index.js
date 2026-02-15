@@ -56,7 +56,9 @@ function safeJSONParse(str, fallback = null) {
   } catch (err) {
     const preview =
       typeof str === "string" ? str.slice(0, 100) : String(str).slice(0, 100);
-    console.warn("[forge] JSON parse error:", err.message, "Input:", preview);
+    if (process.env.FORGE_DEBUG_JSON === "1") {
+      console.warn("[forge] JSON parse error:", err.message, "Input:", preview);
+    }
     return fallback;
   }
 }
@@ -152,6 +154,7 @@ function ensureSchema(db) {
     `CREATE INDEX IF NOT EXISTS idx_features_project_status_priority_created ON features(project_id, status, priority, created_at)`,
     `CREATE INDEX IF NOT EXISTS idx_runs_project ON runs(project_id)`,
     `CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status)`,
+    `CREATE INDEX IF NOT EXISTS idx_runs_feature_id_status ON runs(feature_id, status)`,
     `CREATE INDEX IF NOT EXISTS idx_runs_project_started_at ON runs(project_id, started_at DESC)`,
   ];
 
@@ -347,7 +350,7 @@ function detectCycle(features) {
   const recStack = new Set();
 
   features.forEach((f) => {
-    graph[f.id] = safeJSONParse(f.dependencies, []);
+    graph[f.id] = normalizeDependencyList(f.dependencies);
   });
 
   function dfs(node) {
@@ -385,7 +388,7 @@ function validateDependencies(features) {
   const errors = [];
 
   features.forEach((f) => {
-    const deps = safeJSONParse(f.dependencies, []);
+    const deps = normalizeDependencyList(f.dependencies);
     deps.forEach((dep) => {
       if (!ids.has(dep)) {
         errors.push(`Feature "${f.id}" 依赖不存在的 "${dep}"`);
@@ -689,6 +692,8 @@ const rateLimiter = new RateLimiter({
 const ID_PATTERN = /^[a-zA-Z0-9._:-]{1,128}$/;
 const NAME_PATTERN = /^[a-zA-Z0-9._@/: -]{1,200}$/;
 const REPO_PATTERN = /^[a-zA-Z0-9._-]{1,120}$/;
+const PATH_PATTERN =
+  /^(?!.*\.\.)(?!^\.)(?!.*\/\.)(?!.*\/$)[a-zA-Z0-9._@/-]+(?:\/[a-zA-Z0-9._@-]+)*$/;
 const PACKAGE_PATTERN = /^[a-zA-Z0-9._@/:-]{1,120}$/;
 const COMMAND_UNSAFE_PATTERN = /[;&|`$<>\\\n\r]/;
 const SAFE_TEXT_PATTERN = /^[\s\S]{0,200000}$/;
@@ -721,6 +726,18 @@ function isValidFeatureTransition(fromStatus, toStatus) {
   const allowed = FEATURE_STATUS_TRANSITIONS[fromStatus];
   if (!allowed) return false;
   return allowed.has(toStatus);
+}
+
+function normalizeDependencyList(rawDependencies) {
+  const parsed =
+    typeof rawDependencies === "string"
+      ? safeJSONParse(rawDependencies, [])
+      : rawDependencies;
+  if (!Array.isArray(parsed)) return [];
+  return parsed
+    .filter((item) => typeof item === "string")
+    .map((item) => item.trim())
+    .filter(Boolean);
 }
 
 /**
@@ -824,6 +841,11 @@ function validateToolParams(toolName, params) {
     const repoErr = check(params.repoName, REPO_PATTERN, "repoName");
     if (repoErr) return { valid: false, error: repoErr };
   }
+  if (params.path != null) {
+    if (typeof params.path !== "string" || !PATH_PATTERN.test(params.path)) {
+      return { valid: false, error: "Invalid path format" };
+    }
+  }
   const commonFields = [
     "branch",
     "action",
@@ -858,10 +880,12 @@ function validateToolParams(toolName, params) {
   }
   if (Array.isArray(params.packages)) {
     for (const pkg of params.packages) {
-      if (typeof pkg !== "string" || !PACKAGE_PATTERN.test(pkg)) {
+      if (!isSafePackageName(pkg)) {
         return { valid: false, error: "Invalid package name format" };
       }
     }
+  } else if (params.packages != null) {
+    return { valid: false, error: "packages must be an array" };
   }
   if (typeof params.prd === "string" && !SAFE_TEXT_PATTERN.test(params.prd)) {
     return { valid: false, error: "Invalid prd content length" };
@@ -880,21 +904,63 @@ function validateToolParams(toolName, params) {
   ) {
     return { valid: false, error: "Unsupported git action" };
   }
+  if (
+    toolName === "forge_push" &&
+    params.visibility &&
+    !["public", "private"].includes(params.visibility)
+  ) {
+    return { valid: false, error: "Unsupported visibility value" };
+  }
   return { valid: true };
 }
 
-function sanitizeAuditValue(value) {
+function isSafePackageName(pkg) {
+  if (typeof pkg !== "string") return false;
+  if (!pkg || pkg.length > 120 || pkg.trim() !== pkg) return false;
+  if (!PACKAGE_PATTERN.test(pkg)) return false;
+  if (
+    pkg.includes("..") ||
+    pkg.startsWith("/") ||
+    pkg.startsWith("~") ||
+    pkg.includes("\\")
+  )
+    return false;
+  if (COMMAND_UNSAFE_PATTERN.test(pkg)) return false;
+  return true;
+}
+
+function isSensitiveKey(keyName) {
+  return /(token|secret|password|apikey|api_key|auth|account|email|path|workdir|home|cwd)/i.test(
+    keyName || "",
+  );
+}
+
+function redactStringValue(value, keyName = "") {
+  if (isSensitiveKey(keyName)) {
+    if (/path|workdir|home|cwd/i.test(keyName)) return "[REDACTED_PATH]";
+    if (/email|account/i.test(keyName)) return "[REDACTED_ACCOUNT]";
+    return "[REDACTED_TOKEN]";
+  }
+  if (/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/.test(value))
+    return "[REDACTED_ACCOUNT]";
+  if (/^(\/|[A-Za-z]:\\)/.test(value)) return "[REDACTED_PATH]";
+  if (/(ghp_|sk-|xoxb-|api[_-]?token|bearer\s+)/i.test(value))
+    return "[REDACTED_TOKEN]";
+  return value.length > 300 ? `${value.slice(0, 300)}...` : value;
+}
+
+function sanitizeAuditValue(value, keyName = "") {
   if (value == null) return value;
   if (typeof value === "string") {
-    return value.length > 300 ? `${value.slice(0, 300)}...` : value;
+    return redactStringValue(value, keyName);
   }
   if (Array.isArray(value)) {
-    return value.slice(0, 20).map((item) => sanitizeAuditValue(item));
+    return value.slice(0, 20).map((item) => sanitizeAuditValue(item, keyName));
   }
   if (typeof value === "object") {
     const out = {};
     for (const [k, v] of Object.entries(value)) {
-      out[k] = sanitizeAuditValue(v);
+      out[k] = sanitizeAuditValue(v, k);
     }
     return out;
   }
@@ -1240,7 +1306,7 @@ export default function register(api) {
             );
 
             for (const f of parsed.features) {
-              const scopedDeps = (f.dependencies || []).map(
+              const scopedDeps = normalizeDependencyList(f.dependencies).map(
                 (dep) =>
                   scopedIdMap.get(dep) || toScopedFeatureId(projectId, dep),
               );
@@ -1513,7 +1579,7 @@ After designing, save the result by calling forge_save_architecture with the arc
 
           const ready = features
             .filter((f) => {
-              const deps = safeJSONParse(f.dependencies, []);
+              const deps = normalizeDependencyList(f.dependencies);
               return deps.every(
                 (d) => completeIds.has(d) || !pendingIds.has(d),
               );
@@ -1730,7 +1796,7 @@ Provide the complete implementation including:
 ## Feature: ${feature.name}
 
 **Description**: ${feature.description}
-**Dependencies**: ${safeJSONParse(feature.dependencies, []).join(", ") || "None"}
+**Dependencies**: ${normalizeDependencyList(feature.dependencies).join(", ") || "None"}
 
 ## Work Directory
 ${feature.workdir}
@@ -3502,7 +3568,7 @@ out/
               name: f.name,
               description: f.description,
               priority: f.priority,
-              dependencies: safeJSONParse(f.dependencies, []).map((dep) =>
+              dependencies: normalizeDependencyList(f.dependencies).map((dep) =>
                 fromScopedFeatureId(dep),
               ),
             })),
@@ -3685,7 +3751,7 @@ out/
             ]),
           );
           for (const f of parsed.features) {
-            const scopedDeps = (f.dependencies || []).map(
+            const scopedDeps = normalizeDependencyList(f.dependencies).map(
               (dep) =>
                 scopedIdMap.get(dep) || toScopedFeatureId(projectId, dep),
             );
@@ -3771,7 +3837,7 @@ out/
   );
 
   logger.info?.(
-    "[forge] Extension loaded v2.6.1 - Weekly maintenance (stability + security + perf)",
+    "[forge] Extension loaded v2.6.3 - unattended weekly iteration (stability + security + perf)",
   );
 }
 
@@ -3783,4 +3849,9 @@ export const __testing = {
   normalizeErrorResult,
   computeIncrementalChanges,
   isValidFeatureTransition,
+  detectCycle,
+  validateDependencies,
+  sanitizeAuditValue,
+  normalizeDependencyList,
+  ensureSchema,
 };
